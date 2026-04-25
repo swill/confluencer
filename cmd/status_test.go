@@ -6,12 +6,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
-
-	"github.com/swill/confluencer/index"
 )
 
-func TestRunStatus_NoPending(t *testing.T) {
+func TestRunStatus_NoConfluenceBranch(t *testing.T) {
 	dir := initTestRepo(t)
 	origDir, _ := os.Getwd()
 	os.Chdir(dir)
@@ -23,36 +20,19 @@ func TestRunStatus_NoPending(t *testing.T) {
 	if err := statusCmd.RunE(statusCmd, nil); err != nil {
 		t.Fatalf("runStatus: %v", err)
 	}
-
-	if !strings.Contains(buf.String(), "No pending") {
-		t.Errorf("output = %q", buf.String())
+	if !strings.Contains(buf.String(), "No \"confluence\" branch yet") {
+		t.Errorf("expected unconfigured-state message, got %q", buf.String())
 	}
 }
 
-func TestRunStatus_WithPending(t *testing.T) {
+func TestRunStatus_InSync(t *testing.T) {
 	dir := initTestRepo(t)
+	// Create the confluence branch at the same point as HEAD — nothing to push.
+	run(t, dir, "git", "branch", "confluence", "HEAD")
+
 	origDir, _ := os.Getwd()
 	os.Chdir(dir)
 	defer os.Chdir(origDir)
-
-	// Create a pending file.
-	pendingPath := filepath.Join(dir, pendingFile)
-	index.AppendPending(pendingPath, index.PendingEntry{
-		Type:      index.PendingContent,
-		PageID:    "123",
-		LocalPath: "docs/page.md",
-		Attempt:   2,
-		LastError: "409 version conflict",
-		QueuedAt:  time.Now().UTC(),
-	})
-	index.AppendPending(pendingPath, index.PendingEntry{
-		Type:      index.PendingDelete,
-		PageID:    "456",
-		LocalPath: "docs/gone.md",
-		Attempt:   1,
-		LastError: "network timeout",
-		QueuedAt:  time.Now().UTC(),
-	})
 
 	var buf bytes.Buffer
 	statusCmd.SetOut(&buf)
@@ -60,18 +40,37 @@ func TestRunStatus_WithPending(t *testing.T) {
 	if err := statusCmd.RunE(statusCmd, nil); err != nil {
 		t.Fatalf("runStatus: %v", err)
 	}
+	if !strings.Contains(buf.String(), "In sync") {
+		t.Errorf("expected in-sync message, got %q", buf.String())
+	}
+}
 
+func TestRunStatus_OutOfSync(t *testing.T) {
+	dir := initTestRepo(t)
+	run(t, dir, "git", "branch", "confluence", "HEAD")
+
+	// Add a new .md file on the working branch.
+	if err := os.WriteFile(filepath.Join(dir, "new.md"), []byte("# new\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run(t, dir, "git", "add", "-A")
+	run(t, dir, "git", "commit", "-m", "add new")
+
+	origDir, _ := os.Getwd()
+	os.Chdir(dir)
+	defer os.Chdir(origDir)
+
+	var buf bytes.Buffer
+	statusCmd.SetOut(&buf)
+
+	if err := statusCmd.RunE(statusCmd, nil); err != nil {
+		t.Fatalf("runStatus: %v", err)
+	}
 	output := buf.String()
-	if !strings.Contains(output, "2 pending") {
-		t.Errorf("should report 2 pending: %q", output)
+	if !strings.Contains(output, "1 file(s) differ") {
+		t.Errorf("expected 1 difference reported: %q", output)
 	}
-	if !strings.Contains(output, "docs/page.md") {
-		t.Errorf("should mention page.md: %q", output)
-	}
-	if !strings.Contains(output, "docs/gone.md") {
-		t.Errorf("should mention gone.md: %q", output)
-	}
-	if !strings.Contains(output, "409 version conflict") {
-		t.Errorf("should show error: %q", output)
+	if !strings.Contains(output, "add") || !strings.Contains(output, "new.md") {
+		t.Errorf("expected `add new.md` line: %q", output)
 	}
 }
