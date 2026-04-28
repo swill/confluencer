@@ -14,6 +14,7 @@ import (
 	cfgpkg "github.com/swill/confluencer/config"
 	"github.com/swill/confluencer/gitutil"
 	"github.com/swill/confluencer/lexer"
+	"github.com/swill/confluencer/tree"
 )
 
 var pushCmd = &cobra.Command{
@@ -80,6 +81,21 @@ func runPush(cmd *cobra.Command, args []string) error {
 		return diffs[i].Path < diffs[j].Path
 	})
 
+	// Fetch the tree before any writes so we can canonicalise each pushed
+	// body the same way pull does — round-tripped through CfToMd with the
+	// same resolvers. Without this step, push's confluence-branch commit's
+	// body and a subsequent pull's commit body diverge for any input where
+	// CfToMd is not a fixed point of the storage form (most notably:
+	// multiple consecutive whitespace characters, which the HTML tokeniser
+	// collapses). That latent drift surfaces as a phantom confluence-side
+	// change on the next merge cycle and conflicts with concurrent
+	// main-side edits on the same line.
+	ct, err := client.FetchTree(cfg.RootPageID, false)
+	if err != nil {
+		return fmt.Errorf("fetch tree: %w", err)
+	}
+	pm := tree.ComputePaths(ct, cfg.LocalRoot)
+
 	fmt.Fprintf(out, "[confluencer] %d file(s) to push\n", len(diffs))
 
 	var successes []pushOp
@@ -96,6 +112,8 @@ func runPush(cmd *cobra.Command, args []string) error {
 		fmt.Fprintf(out, "[confluencer] nothing pushed (all operations failed)\n")
 		return nil
 	}
+
+	canonicalisePushOps(successes, cfg, ct, pm, out)
 
 	if err := advanceConfluenceBranch(root, successes, out); err != nil {
 		return fmt.Errorf("advance %s branch: %w", confluenceBranch, err)
@@ -139,10 +157,15 @@ type pushOp struct {
 	NewPath string // populated for Add, Modify, Rename ("" for Delete)
 	PageID  string // page ID after the op (for Add: newly assigned)
 	Version int    // version after the op
-	// HeadContent is the body of the file as it appears on HEAD (without
-	// front-matter), kept so advanceConfluenceBranch can rewrite the file
-	// on the confluence branch with the canonical front-matter.
+	// HeadContent is the body of the file as we'll write it to the
+	// confluence branch (without front-matter). Initially set to HEAD's
+	// body by each apply function; canonicalisePushOps then re-renders it
+	// through CfToMd so it matches what a future pull would produce.
 	HeadContent string
+	// StorageXML is the storage-format body we sent to Confluence, kept
+	// so canonicalisePushOps can round-trip it back to markdown without
+	// recomputing MdToCf.
+	StorageXML string
 }
 
 // applyDiff dispatches a single FileDiff to the right Confluence-side handler.
@@ -194,7 +217,7 @@ func applyAdded(client *api.Client, cfg *cfgpkg.Config, root, path string, prevS
 	return pushOp{
 		Action: gitutil.ActionAdded, NewPath: path,
 		PageID: page.PageID, Version: page.Version,
-		HeadContent: body,
+		HeadContent: body, StorageXML: storageXML,
 	}, nil
 }
 
@@ -277,7 +300,7 @@ func applyRenamed(client *api.Client, cfg *cfgpkg.Config, root, oldPath, newPath
 	return pushOp{
 		Action: gitutil.ActionRenamed, OldPath: oldPath, NewPath: newPath,
 		PageID: pageID, Version: newVersion,
-		HeadContent: body,
+		HeadContent: body, StorageXML: storageXML,
 	}, nil
 }
 
@@ -302,8 +325,37 @@ func updateExistingPage(client *api.Client, cfg *cfgpkg.Config, root, path, page
 	return pushOp{
 		Action: gitutil.ActionModified, NewPath: path,
 		PageID: pageID, Version: newVersion,
-		HeadContent: body,
+		HeadContent: body, StorageXML: storageXML,
 	}, nil
+}
+
+// canonicalisePushOps rewrites each op's HeadContent to the form a future
+// pull would write to the confluence branch for the same page — i.e., the
+// markdown produced by CfToMd applied to the storage XML we just sent up,
+// using the same resolvers pull uses. This makes push's confluence-branch
+// commit byte-identical to the next pull's commit for unchanged Confluence
+// content. Without it, lossy steps in CfToMd (e.g., HTML whitespace
+// tokenisation collapsing runs of spaces) appear as phantom confluence-side
+// changes on the next merge cycle and conflict with concurrent main-side
+// edits on the same line.
+//
+// Best effort: if the round-trip fails for an op, the un-canonicalised body
+// is left in place. That preserves today's behaviour as a fallback rather
+// than aborting an otherwise-successful push.
+func canonicalisePushOps(ops []pushOp, cfg *cfgpkg.Config, ct *tree.CfTree, pm *tree.PathMap, out io.Writer) {
+	for i := range ops {
+		op := &ops[i]
+		if op.StorageXML == "" || op.NewPath == "" {
+			continue
+		}
+		opts := resolverForPage(op.NewPath, cfg, ct, pm)
+		rt, err := lexer.CfToMd(op.StorageXML, opts)
+		if err != nil {
+			fmt.Fprintf(out, "[confluencer] WARNING: canonicalise %s: %v\n", op.NewPath, err)
+			continue
+		}
+		op.HeadContent = rt
+	}
 }
 
 // updatePageWithRetry tries UpdatePage at version+1 once, and if the server
@@ -472,7 +524,8 @@ func advanceConfluenceBranch(root string, ops []pushOp, out io.Writer) error {
 	}
 
 	commitMsg := gitutil.SyncPrefix + "-push @ " + time.Now().UTC().Format(time.RFC3339)
-	if _, err := gitutil.CommitAllOnHead(root, commitMsg); err != nil {
+	sha, err := gitutil.CommitAllOnHead(root, commitMsg)
+	if err != nil {
 		_ = gitutil.Checkout(root, origBranch)
 		if stashed {
 			_ = gitutil.StashPop(root)
@@ -483,6 +536,42 @@ func advanceConfluenceBranch(root string, ops []pushOp, out io.Writer) error {
 	if err := gitutil.Checkout(root, origBranch); err != nil {
 		return fmt.Errorf("return to %s: %w", origBranch, err)
 	}
+
+	// Merge the just-advanced confluence branch into the working branch so the
+	// push-side sync commit is in the working branch's ancestry. Without this,
+	// the merge base for the next pull would be the previous confluence tip,
+	// and changes the push has already mirrored would re-appear as fresh
+	// confluence-side edits — producing spurious conflicts when the user later
+	// edits the same lines.
+	//
+	// "-X theirs" is the right resolution policy here: when push creates a
+	// new page, the user's working-branch commit has no front-matter while
+	// the confluence-branch copy does. Both branches "added" the same path
+	// with different content; the canonical form (with front-matter, version,
+	// and lexer normalisation) is the authoritative one — that's what's now
+	// on Confluence. Same logic for the rarer in-place edit where lexer
+	// normalisation produced a body that differs from what the user typed.
+	//
+	// Tree is guaranteed clean here: we either entered clean, or stashed at
+	// the top of this function and haven't popped yet.
+	if sha != "" {
+		conflict, mergeErr := gitutil.MergeFromPreferTheirs(root, confluenceBranch)
+		if mergeErr != nil {
+			if stashed {
+				_ = gitutil.StashPop(root)
+			}
+			return fmt.Errorf("merge %s into %s after push: %w", confluenceBranch, origBranch, mergeErr)
+		}
+		if conflict {
+			// Don't pop the stash on top of an in-progress merge — leave the
+			// repo in a state the user can resolve with the standard tools.
+			fmt.Fprintf(out, "[confluencer] CONFLICT: post-push merge from %s has conflicts.\n", confluenceBranch)
+			fmt.Fprintf(out, "[confluencer]   Resolve with your editor and `git merge --continue`,\n")
+			fmt.Fprintf(out, "[confluencer]   or abort with `git merge --abort`.\n")
+			return nil
+		}
+	}
+
 	if stashed {
 		if err := gitutil.StashPop(root); err != nil {
 			return fmt.Errorf("stash pop: %w", err)

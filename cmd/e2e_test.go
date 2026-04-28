@@ -200,7 +200,8 @@ func TestE2E_PushNewFileNoConflict(t *testing.T) {
 		t.Errorf("expected 2 pages on Confluence (root + new), got %d", len(pages))
 	}
 
-	// Working tree should be clean: push doesn't write to main.
+	// Working tree should be clean: push commits its post-push merge into
+	// main automatically, so there's nothing for the user to stage or fix up.
 	if status := r.gitStatus(); status != "" {
 		t.Errorf("expected clean tree after push, got:\n%s", status)
 	}
@@ -289,6 +290,155 @@ func TestE2E_PullPicksUpRemoteChange(t *testing.T) {
 	}
 	if !strings.Contains(got, "confluence_version: 5") {
 		t.Errorf("version not updated: %q", got)
+	}
+}
+
+// TestE2E_EditCycleNoSpuriousConflict reproduces the failure mode where a
+// second edit-on-both-sides cycle conflicts on a line that *only the
+// confluence side* edited in cycle 2. The pre-fix bug: push advanced the
+// confluence branch but didn't merge that advance into the working branch,
+// so cycle 2's pull used cycle 1's *pre-push* confluence commit as the
+// merge base — making cycle 1's user-side edit look like a fresh main-side
+// change relative to base, even though Confluence already canonically
+// holds it. Cycle 2's confluence-side edit on the same line then collides
+// with that ghost.
+//
+// Sequence:
+//
+//   - Cycle 1: line one edited externally on Confluence; line two edited
+//     locally → commit → pull (clean merge — disjoint changes) → push.
+//   - Cycle 2: line two edited externally on Confluence (overwriting the
+//     line the user just pushed); line three edited locally → commit →
+//     pull. Disjoint changes from the post-push state, so this must be
+//     clean. With a stale merge base it conflicts on line two.
+func TestE2E_EditCycleNoSpuriousConflict(t *testing.T) {
+	r := newE2ERepo(t, [][4]string{
+		{"100", "", "Root", "<p>line one</p><p>line two</p><p>line three</p>"},
+	})
+
+	if err := r.runPullInRepo(); err != nil {
+		t.Fatalf("seed pull: %v", err)
+	}
+
+	// Cycle 1 confluence-side edit.
+	r.mock.mu.Lock()
+	r.mock.pages["100"].Body = "<p>line one external</p><p>line two</p><p>line three</p>"
+	r.mock.pages["100"].Version = 2
+	r.mock.mu.Unlock()
+
+	// Cycle 1 local edit to a different line, then pull (which merges
+	// confluence's external change in) and push (which sends the local
+	// edit upstream).
+	c1 := r.readFile("docs/index.md")
+	c1edit := strings.Replace(c1, "line two", "line two local", 1)
+	if c1edit == c1 {
+		t.Fatalf("cycle 1: expected line-two substitution to apply: %q", c1)
+	}
+	r.commit("docs/index.md", c1edit, "edit line two")
+
+	if err := r.runPullInRepo(); err != nil {
+		t.Fatalf("cycle 1 pull: %v", err)
+	}
+	if err := r.runPushInRepo(); err != nil {
+		t.Fatalf("cycle 1 push: %v", err)
+	}
+	if status := r.gitStatus(); status != "" {
+		t.Fatalf("expected clean tree after cycle 1 push, got:\n%s", status)
+	}
+
+	// Cycle 2 confluence-side edit hits line two — the line the user just
+	// pushed up. Pre-fix, line two is the conflict surface in the next
+	// pull because the stale merge base still has its original value.
+	r.mock.mu.Lock()
+	r.mock.pages["100"].Body = "<p>line one external</p><p>line two external</p><p>line three</p>"
+	r.mock.pages["100"].Version = 4
+	r.mock.mu.Unlock()
+
+	// Cycle 2 local edit to line three (a line nothing on the confluence
+	// side has touched this cycle).
+	c2 := r.readFile("docs/index.md")
+	c2edit := strings.Replace(c2, "line three", "line three local", 1)
+	if c2edit == c2 {
+		t.Fatalf("cycle 2: expected line-three substitution to apply: %q", c2)
+	}
+	r.commit("docs/index.md", c2edit, "edit line three")
+
+	if err := r.runPullInRepo(); err != nil {
+		t.Fatalf("cycle 2 pull: %v", err)
+	}
+	if status := r.gitStatus(); status != "" {
+		t.Errorf("BUG REGRESSION: expected clean tree after cycle 2 pull, got:\n%s", status)
+	}
+
+	got := r.readFile("docs/index.md")
+	for _, want := range []string{"line one external", "line two external", "line three local"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("merged file missing %q:\n%s", want, got)
+		}
+	}
+}
+
+// TestE2E_PushBodyMatchesPullCanonicalForm reproduces the second failure
+// mode the user hit: even with the post-push merge in place, push's
+// confluence-branch body and the next pull's confluence-branch body for
+// the same Confluence content can diverge — because CfToMd is not a
+// fixed point on certain inputs (e.g., HTML whitespace tokenisation
+// collapses runs of spaces).
+//
+// Concretely: a body line "second line.  edit from markdown" survives
+// Normalise byte-for-byte but loses one space after a CfToMd round-trip.
+// Pre-fix, push wrote the un-roundtripped form to the confluence branch,
+// so the next pull's commit (which goes through CfToMd) appeared to have
+// edited that line on the confluence side — colliding with any
+// concurrent main-side edit to the same line, even when the only "real"
+// change in this cycle was on a different line.
+func TestE2E_PushBodyMatchesPullCanonicalForm(t *testing.T) {
+	r := newE2ERepo(t, [][4]string{
+		{"100", "", "Root", "<p>first line.</p><p>second line.</p>"},
+	})
+	if err := r.runPullInRepo(); err != nil {
+		t.Fatalf("seed pull: %v", err)
+	}
+
+	// Cycle 1 user edit: introduces a doubled-space run on line two.
+	// (A user typing in their editor — the fact that the canonical pull
+	// form produces single spaces is irrelevant to what they commit.)
+	body := r.readFile("docs/index.md")
+	c1 := strings.Replace(body, "second line.", "second line.  edit from markdown.", 1)
+	if c1 == body {
+		t.Fatalf("cycle 1: expected line-two substitution to apply: %q", body)
+	}
+	r.commit("docs/index.md", c1, "cycle 1 markdown edit")
+
+	if err := r.runPushInRepo(); err != nil {
+		t.Fatalf("cycle 1 push: %v", err)
+	}
+
+	// Cycle 2: a different line is edited on Confluence (so there's a
+	// real change to pull). Line two — the doubled-space line — is left
+	// untouched on the Confluence side.
+	r.mock.mu.Lock()
+	r.mock.pages["100"].Body = "<p>first line. edit from confluence.</p><p>second line.  edit from markdown.</p>"
+	r.mock.pages["100"].Version = r.mock.pages["100"].Version + 1
+	r.mock.mu.Unlock()
+
+	// Cycle 2 user edit: re-touches line two with a different wording,
+	// preserving the doubled-space run. Pre-fix, the merge base's line
+	// two has doubled spaces but the cycle 2 confluence commit has
+	// single spaces (CfToMd collapsed them) — both sides "modified"
+	// line two and git produces a conflict.
+	cur := r.readFile("docs/index.md")
+	c2 := strings.Replace(cur, "edit from markdown.", "second edit from markdown.", 1)
+	if c2 == cur {
+		t.Fatalf("cycle 2: expected line-two substitution to apply: %q", cur)
+	}
+	r.commit("docs/index.md", c2, "cycle 2 markdown edit")
+
+	if err := r.runPullInRepo(); err != nil {
+		t.Fatalf("cycle 2 pull: %v", err)
+	}
+	if status := r.gitStatus(); status != "" {
+		t.Errorf("BUG REGRESSION: expected clean tree after cycle 2 pull, got:\n%s", status)
 	}
 }
 

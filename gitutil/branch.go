@@ -89,7 +89,23 @@ func CommitAllOnHead(repoDir, message string) (string, error) {
 //
 // Other failures (no such branch, etc.) return an error.
 func MergeFrom(repoDir, from string) (conflict bool, err error) {
-	cmd := exec.Command("git", "merge", "--no-edit", from)
+	return mergeRun(repoDir, []string{"merge", "--no-edit", from}, from)
+}
+
+// MergeFromPreferTheirs runs `git merge --no-edit -X theirs <from>` — same
+// shape as MergeFrom, but conflicts auto-resolve in favour of <from>.
+//
+// Used by push after it advances the confluence branch: the working branch
+// needs to incorporate the just-pushed canonical form (frontmatter, version
+// bump, lexer normalisation) so the next pull's merge base is fresh. On the
+// rare line-level overlap, the canonical form is the authoritative version
+// — that's what's now on Confluence.
+func MergeFromPreferTheirs(repoDir, from string) (conflict bool, err error) {
+	return mergeRun(repoDir, []string{"merge", "--no-edit", "-X", "theirs", from}, from)
+}
+
+func mergeRun(repoDir string, args []string, from string) (conflict bool, err error) {
+	cmd := exec.Command("git", args...)
 	cmd.Dir = repoDir
 	out, runErr := cmd.CombinedOutput()
 	if runErr == nil {
