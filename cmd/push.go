@@ -109,7 +109,7 @@ func runPush(cmd *cobra.Command, args []string) error {
 
 	var successes []pushOp
 	for _, d := range diffs {
-		op, err := applyDiff(client, cfg, root, d, &successes, out)
+		op, err := applyDiff(client, cfg, root, ct, pm, d, &successes, out)
 		if err != nil {
 			fmt.Fprintf(out, "[gfl] WARNING: %s %s: %v\n", d.Action, displayPath(d), err)
 			continue
@@ -178,16 +178,16 @@ type pushOp struct {
 }
 
 // applyDiff dispatches a single FileDiff to the right Confluence-side handler.
-func applyDiff(client *api.Client, cfg *cfgpkg.Config, root string, d gitutil.FileDiff, prevSuccesses *[]pushOp, out io.Writer) (pushOp, error) {
+func applyDiff(client *api.Client, cfg *cfgpkg.Config, root string, ct *tree.CfTree, pm *tree.PathMap, d gitutil.FileDiff, prevSuccesses *[]pushOp, out io.Writer) (pushOp, error) {
 	switch d.Action {
 	case gitutil.ActionAdded:
-		return applyAdded(client, cfg, root, d.Path, prevSuccesses, out)
+		return applyAdded(client, cfg, root, ct, pm, d.Path, prevSuccesses, out)
 	case gitutil.ActionModified:
-		return applyModified(client, cfg, root, d.Path, out)
+		return applyModified(client, cfg, root, ct, pm, d.Path, out)
 	case gitutil.ActionDeleted:
 		return applyDeleted(client, root, d.Path, out)
 	case gitutil.ActionRenamed:
-		return applyRenamed(client, cfg, root, d.OldPath, d.Path, prevSuccesses, out)
+		return applyRenamed(client, cfg, root, ct, pm, d.OldPath, d.Path, prevSuccesses, out)
 	}
 	return pushOp{}, fmt.Errorf("unknown action %q", d.Action)
 }
@@ -195,7 +195,7 @@ func applyDiff(client *api.Client, cfg *cfgpkg.Config, root string, d gitutil.Fi
 // applyAdded handles a new .md file at path on HEAD. If HEAD's front-matter
 // already names a confluence_page_id, we adopt that page (validated via a
 // GetPage round-trip); otherwise we POST a new page.
-func applyAdded(client *api.Client, cfg *cfgpkg.Config, root, path string, prevSuccesses *[]pushOp, out io.Writer) (pushOp, error) {
+func applyAdded(client *api.Client, cfg *cfgpkg.Config, root string, ct *tree.CfTree, pm *tree.PathMap, path string, prevSuccesses *[]pushOp, out io.Writer) (pushOp, error) {
 	body, fm, err := readBodyAtHead(root, path)
 	if err != nil {
 		return pushOp{}, fmt.Errorf("read HEAD:%s: %w", path, err)
@@ -204,12 +204,13 @@ func applyAdded(client *api.Client, cfg *cfgpkg.Config, root, path string, prevS
 	// If HEAD's front-matter names a page that genuinely exists, treat as adopt-and-update.
 	if fm.PageID != "" {
 		if _, getErr := client.GetPage(fm.PageID); getErr == nil {
-			return updateExistingPage(client, cfg, root, path, fm.PageID, body, out)
+			return updateExistingPage(client, cfg, root, ct, pm, path, fm.PageID, body, out)
 		}
 		// page_id stale or wrong — fall through and create fresh.
 	}
 
-	storageXML, err := lexer.MdToCf(body, lexer.MdToCfOpts{})
+	mdOpts, attRes := pushResolvers(path, cfg, ct, pm)
+	storageXML, err := lexer.MdToCf(body, mdOpts)
 	if err != nil {
 		return pushOp{}, fmt.Errorf("convert %s: %w", path, err)
 	}
@@ -222,6 +223,8 @@ func applyAdded(client *api.Client, cfg *cfgpkg.Config, root, path string, prevS
 		return pushOp{}, fmt.Errorf("create page %s: %w", path, err)
 	}
 
+	uploadResolvedAttachments(client, root, page.PageID, attRes, out)
+
 	fmt.Fprintf(out, "[gfl] create: %s (page %s)\n", path, page.PageID)
 	return pushOp{
 		Action: gitutil.ActionAdded, NewPath: path,
@@ -233,7 +236,7 @@ func applyAdded(client *api.Client, cfg *cfgpkg.Config, root, path string, prevS
 // applyModified handles content changes to an existing tracked .md file.
 // The page ID is read from the confluence branch's copy of the file — that's
 // the canonical bridge between path and Confluence page.
-func applyModified(client *api.Client, cfg *cfgpkg.Config, root, path string, out io.Writer) (pushOp, error) {
+func applyModified(client *api.Client, cfg *cfgpkg.Config, root string, ct *tree.CfTree, pm *tree.PathMap, path string, out io.Writer) (pushOp, error) {
 	pageID, err := pageIDOnConfluenceBranch(root, path)
 	if err != nil {
 		return pushOp{}, fmt.Errorf("locate page ID for %s on %s: %w", path, confluenceBranch, err)
@@ -242,7 +245,7 @@ func applyModified(client *api.Client, cfg *cfgpkg.Config, root, path string, ou
 	if err != nil {
 		return pushOp{}, fmt.Errorf("read HEAD:%s: %w", path, err)
 	}
-	return updateExistingPage(client, cfg, root, path, pageID, body, out)
+	return updateExistingPage(client, cfg, root, ct, pm, path, pageID, body, out)
 }
 
 // applyDeleted handles a .md file that's gone from HEAD but present on the
@@ -266,7 +269,7 @@ func applyDeleted(client *api.Client, root, path string, out io.Writer) (pushOp,
 // Updates the Confluence page's title (subject to the Title Stability Rule)
 // and parent (if the rename crossed a directory boundary), and pushes the
 // current body content along with it.
-func applyRenamed(client *api.Client, cfg *cfgpkg.Config, root, oldPath, newPath string, prevSuccesses *[]pushOp, out io.Writer) (pushOp, error) {
+func applyRenamed(client *api.Client, cfg *cfgpkg.Config, root string, ct *tree.CfTree, pm *tree.PathMap, oldPath, newPath string, prevSuccesses *[]pushOp, out io.Writer) (pushOp, error) {
 	pageID, err := pageIDOnConfluenceBranch(root, oldPath)
 	if err != nil {
 		return pushOp{}, fmt.Errorf("locate page ID for renamed %s: %w", oldPath, err)
@@ -295,7 +298,8 @@ func applyRenamed(client *api.Client, cfg *cfgpkg.Config, root, oldPath, newPath
 		newParentID = ensurePushParents(client, cfg, root, newPath, prevSuccesses, out)
 	}
 
-	storageXML, err := lexer.MdToCf(body, lexer.MdToCfOpts{})
+	mdOpts, attRes := pushResolvers(newPath, cfg, ct, pm)
+	storageXML, err := lexer.MdToCf(body, mdOpts)
 	if err != nil {
 		return pushOp{}, fmt.Errorf("convert %s: %w", newPath, err)
 	}
@@ -304,6 +308,8 @@ func applyRenamed(client *api.Client, cfg *cfgpkg.Config, root, oldPath, newPath
 	if err != nil {
 		return pushOp{}, err
 	}
+
+	uploadResolvedAttachments(client, root, pageID, attRes, out)
 
 	fmt.Fprintf(out, "[gfl] rename: %s → %s (page %s)\n", oldPath, newPath, pageID)
 	return pushOp{
@@ -315,12 +321,13 @@ func applyRenamed(client *api.Client, cfg *cfgpkg.Config, root, oldPath, newPath
 
 // updateExistingPage is the shared inner of "modify content of page X" used
 // by applyModified and the adopt-then-update branch of applyAdded.
-func updateExistingPage(client *api.Client, cfg *cfgpkg.Config, root, path, pageID, body string, out io.Writer) (pushOp, error) {
+func updateExistingPage(client *api.Client, cfg *cfgpkg.Config, root string, ct *tree.CfTree, pm *tree.PathMap, path, pageID, body string, out io.Writer) (pushOp, error) {
 	page, err := client.GetPage(pageID)
 	if err != nil {
 		return pushOp{}, fmt.Errorf("fetch page %s: %w", pageID, err)
 	}
-	storageXML, err := lexer.MdToCf(body, lexer.MdToCfOpts{})
+	mdOpts, attRes := pushResolvers(path, cfg, ct, pm)
+	storageXML, err := lexer.MdToCf(body, mdOpts)
 	if err != nil {
 		return pushOp{}, fmt.Errorf("convert %s: %w", path, err)
 	}
@@ -330,12 +337,54 @@ func updateExistingPage(client *api.Client, cfg *cfgpkg.Config, root, path, page
 		return pushOp{}, err
 	}
 
+	uploadResolvedAttachments(client, root, pageID, attRes, out)
+
 	fmt.Fprintf(out, "[gfl] update: %s (page %s)\n", path, pageID)
 	return pushOp{
 		Action: gitutil.ActionModified, NewPath: path,
 		PageID: pageID, Version: newVersion,
 		HeadContent: body, StorageXML: storageXML,
 	}, nil
+}
+
+// uploadResolvedAttachments uploads the binary files corresponding to each
+// attachment image resolved during MdToCf conversion. The pushAttachmentResolver
+// records every (filename, repo-relative on-disk path) pair it resolved; we
+// read each file and POST it to /content/{pageID}/child/attachment.
+//
+// Confluence treats a re-upload of the same filename as a new version of the
+// existing attachment, so this is idempotent for our purposes — we don't
+// need to compare contents or skip unchanged files.
+//
+// Failures are logged as warnings rather than aborting the push, in keeping
+// with the "push never blocks permanently" invariant: a missing or transient
+// upload reappears in the next push's diff (the .md still references the
+// attachment) and gets retried.
+func uploadResolvedAttachments(client *api.Client, root, pageID string, res *pushAttachmentResolver, out io.Writer) {
+	if res == nil || len(res.resolved) == 0 {
+		return
+	}
+	// Sort filenames so log output is deterministic.
+	names := make([]string, 0, len(res.resolved))
+	for n := range res.resolved {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+
+	for _, filename := range names {
+		repoRelPath := res.resolved[filename]
+		absPath := filepath.Join(root, filepath.FromSlash(repoRelPath))
+		data, err := os.ReadFile(absPath)
+		if err != nil {
+			fmt.Fprintf(out, "[gfl] WARNING: read attachment %s: %v\n", repoRelPath, err)
+			continue
+		}
+		if err := client.UploadAttachment(pageID, filename, data); err != nil {
+			fmt.Fprintf(out, "[gfl] WARNING: upload %s to page %s: %v\n", filename, pageID, err)
+			continue
+		}
+		fmt.Fprintf(out, "[gfl] attach: %s → page %s\n", repoRelPath, pageID)
+	}
 }
 
 // canonicalisePushOps rewrites each op's HeadContent to the form a future

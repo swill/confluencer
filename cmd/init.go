@@ -3,6 +3,7 @@ package cmd
 import (
 	"fmt"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 
@@ -230,6 +231,13 @@ func writeGitignoreStub(root string) {
 
 // stubAttachmentResolver resolves attachment image references during
 // cf_to_md conversion. It's used by both init and pull via resolverForPage.
+//
+// The emitted path is relative to the source .md file's directory rather
+// than repo-rooted, so the resulting Markdown renders correctly in any
+// viewer (GitHub web, IDE preview, etc.) — they all resolve image srcs
+// relative to the file containing them. A repo-rooted path like
+// "docs/_attachments/foo.png" embedded in "docs/diagrams.md" would be
+// interpreted as "docs/docs/_attachments/foo.png" by such viewers.
 type stubAttachmentResolver struct {
 	localPath      string
 	attachmentsDir string
@@ -238,5 +246,25 @@ type stubAttachmentResolver struct {
 
 func (r *stubAttachmentResolver) AttachmentSrc(filename string) string {
 	attDir := tree.AttachmentDir(r.localPath, r.localRoot, r.attachmentsDir)
-	return attDir + "/" + filename
+	target := path.Join(attDir, filename)
+	sourceDir := path.Dir(r.localPath)
+	return relPath(sourceDir, target)
+}
+
+// relPath returns the slash-separated relative path from dir to target.
+// Both inputs are slash-normalised; the output uses forward slashes too.
+// Falls back to target verbatim if the platform's filepath.Rel can't
+// compute one (e.g. across drive letters on Windows — not a concern on
+// the slash-normalised paths gfl works with, but kept defensive).
+func relPath(dir, target string) string {
+	dir = path.Clean(dir)
+	target = path.Clean(target)
+	if dir == "." || dir == "" {
+		return target
+	}
+	rel, err := filepath.Rel(filepath.FromSlash(dir), filepath.FromSlash(target))
+	if err != nil {
+		return target
+	}
+	return filepath.ToSlash(rel)
 }

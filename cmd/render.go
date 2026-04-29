@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 
@@ -143,4 +144,124 @@ func (r *treePageResolver) ResolvePageByTitle(title, spaceKey string) (string, b
 		return "", false
 	}
 	return r.paths.Path(found.PageID)
+}
+
+// pushAttachmentResolver implements lexer.MdAttachmentResolver for the
+// md_to_cf direction. Given a Markdown image src, it determines whether the
+// referenced path resolves under the configured attachments directory; if
+// so, it returns the leaf filename to embed in <ri:attachment ri:filename>.
+//
+// The resolver also records every resolved attachment as a side effect, so
+// the push path can iterate over them after MdToCf to upload the binary
+// files to Confluence (Phase 3 of the image fix). This avoids re-parsing
+// the Markdown body.
+type pushAttachmentResolver struct {
+	localPath      string // repo-relative, slash-separated path of the source .md
+	localRoot      string
+	attachmentsDir string
+	// resolved maps filename → repo-relative path of the on-disk binary,
+	// populated as ResolveImage is called during conversion.
+	resolved map[string]string
+}
+
+// ResolveImage implements lexer.MdAttachmentResolver. It accepts both
+// document-relative paths (e.g. "../_attachments/foo/bar.png") and absolute
+// repo-relative paths (e.g. "docs/_attachments/foo/bar.png"); the cf_to_md
+// direction historically emits the latter form, so the inverse must accept
+// it.
+func (r *pushAttachmentResolver) ResolveImage(src string) (string, bool) {
+	abs := r.canonicalAttachmentPath(src)
+	if abs == "" {
+		return "", false
+	}
+	filename := path.Base(abs)
+	if r.resolved == nil {
+		r.resolved = make(map[string]string)
+	}
+	r.resolved[filename] = abs
+	return filename, true
+}
+
+// canonicalAttachmentPath returns the repo-relative cleaned path if src
+// references something under r.attachmentsDir, or "" if it doesn't.
+//
+// Two interpretations are tried, in order:
+//
+//  1. src as a path relative to the source document's directory (the
+//     CommonMark default for `![alt](rel/path)`).
+//  2. src as already a repo-relative absolute-ish path (the form the
+//     existing cf_to_md AttachmentSrc emits).
+//
+// Either match is accepted; non-matching srcs (external URLs, paths outside
+// the attachments tree) return "".
+func (r *pushAttachmentResolver) canonicalAttachmentPath(src string) string {
+	if src == "" {
+		return ""
+	}
+	attDirSlash := strings.TrimSuffix(r.attachmentsDir, "/") + "/"
+
+	sourceDir := path.Dir(r.localPath)
+	rel := path.Join(sourceDir, src)
+	if strings.HasPrefix(rel, attDirSlash) {
+		return rel
+	}
+
+	direct := path.Clean(src)
+	if strings.HasPrefix(direct, attDirSlash) {
+		return direct
+	}
+	return ""
+}
+
+// pushPageResolver implements lexer.MdPageResolver against a CfTree and
+// PathMap. It resolves Markdown link targets relative to the source
+// document's directory, looks up the resulting path in the PathMap, and
+// returns the corresponding Confluence page's title and space.
+type pushPageResolver struct {
+	localPath string
+	tree      *tree.CfTree
+	paths     *tree.PathMap
+}
+
+// ResolveLink implements lexer.MdPageResolver.
+func (r *pushPageResolver) ResolveLink(target string) (title, space string, ok bool) {
+	if target == "" {
+		return "", "", false
+	}
+	// External links and anchors are not page references.
+	if strings.Contains(target, "://") || strings.HasPrefix(target, "#") || strings.HasPrefix(target, "mailto:") {
+		return "", "", false
+	}
+	// Drop any fragment (#section) before resolving.
+	if i := strings.Index(target, "#"); i >= 0 {
+		target = target[:i]
+	}
+	if target == "" {
+		return "", "", false
+	}
+	sourceDir := path.Dir(r.localPath)
+	abs := path.Join(sourceDir, target)
+	pageID, ok := r.paths.PageID(abs)
+	if !ok {
+		return "", "", false
+	}
+	page := r.tree.Page(pageID)
+	if page == nil {
+		return "", "", false
+	}
+	return page.Title, page.SpaceKey, true
+}
+
+// pushResolvers builds the md_to_cf resolver pair (pages + attachments) for
+// a given source document path. The attachment resolver is returned
+// separately so callers (push) can iterate over which attachments were
+// resolved during conversion in order to upload them.
+func pushResolvers(localPath string, cfg *cfgpkg.Config, ct *tree.CfTree, pm *tree.PathMap) (lexer.MdToCfOpts, *pushAttachmentResolver) {
+	pages := &pushPageResolver{localPath: localPath, tree: ct, paths: pm}
+	attachments := &pushAttachmentResolver{
+		localPath:      localPath,
+		localRoot:      cfg.LocalRoot,
+		attachmentsDir: cfg.AttachmentsDir,
+	}
+	return lexer.MdToCfOpts{Pages: pages, Attachments: attachments}, attachments
 }

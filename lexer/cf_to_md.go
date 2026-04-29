@@ -287,6 +287,15 @@ func (r *cfRenderer) renderBlock(n *cfNode) string {
 		inner.opts = r.opts
 		inner.renderBlocks(n.children)
 		return strings.TrimRight(inner.sb.String(), "\n")
+	case "ac:image":
+		// Confluence emits <ac:image> at the block level when the image
+		// carries layout/sizing attributes (ac:align, ac:width, ac:layout,
+		// etc.). Render it as a standalone Markdown image — the styling
+		// attributes are intentionally dropped (Markdown can't represent
+		// them) but the image content and its attachment link survive.
+		var sb strings.Builder
+		r.writeAcImage(&sb, n)
+		return sb.String()
 	default:
 		// Anything else block-level — including unknown HTML elements that
 		// don't fit the supported set — gets fence-preserved so the round trip

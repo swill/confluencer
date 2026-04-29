@@ -35,6 +35,13 @@ type mockConfluence struct {
 
 	pages  map[string]*mockPage
 	nextID int
+
+	// attachments records every successful POST to /child/attachment.
+	// Keyed by pageID; each value is filename → bytes (latest version).
+	attachments map[string]map[string][]byte
+	// nextAttID assigns synthetic numeric IDs to uploaded attachments
+	// so the GET /child/attachment response can echo a stable identifier.
+	nextAttID int
 }
 
 type mockPage struct {
@@ -51,8 +58,10 @@ type mockPage struct {
 // auto-assigned IDs for new POSTs continue from max+1).
 func newMockConfluence(spaceKey string, tree [][4]string) *mockConfluence {
 	m := &mockConfluence{
-		spaceKey: spaceKey,
-		pages:    make(map[string]*mockPage),
+		spaceKey:    spaceKey,
+		pages:       make(map[string]*mockPage),
+		attachments: make(map[string]map[string][]byte),
+		nextAttID:   1,
 	}
 	maxID := 0
 	for _, t := range tree {
@@ -103,10 +112,14 @@ func (m *mockConfluence) AllPages() map[string]mockPage {
 func (m *mockConfluence) handle(w http.ResponseWriter, r *http.Request) {
 	p := r.URL.Path
 	switch {
+	case r.Method == http.MethodGet && strings.HasPrefix(p, "/download/attachments/"):
+		m.handleDownloadAttachment(w, r)
 	case r.Method == http.MethodGet && strings.HasSuffix(p, "/child/page"):
 		m.handleChildren(w, r)
 	case r.Method == http.MethodGet && strings.HasSuffix(p, "/child/attachment"):
 		m.handleAttachments(w, r)
+	case r.Method == http.MethodPost && strings.HasSuffix(p, "/child/attachment"):
+		m.handleUploadAttachment(w, r)
 	case r.Method == http.MethodGet && strings.HasPrefix(p, "/rest/api/content/"):
 		m.handleGetPage(w, r)
 	case r.Method == http.MethodPost && p == "/rest/api/content":
@@ -170,16 +183,141 @@ func (m *mockConfluence) handleChildren(w http.ResponseWriter, r *http.Request) 
 }
 
 func (m *mockConfluence) handleAttachments(w http.ResponseWriter, r *http.Request) {
-	// We don't model attachments yet; return empty.
+	// .../content/{pageID}/child/attachment
+	parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/rest/api/content/"), "/")
+	if len(parts) < 1 {
+		http.NotFound(w, r)
+		return
+	}
+	pageID := parts[0]
+
+	m.mu.Lock()
+	files := m.attachments[pageID]
+	m.mu.Unlock()
+
 	out := struct {
-		Results []any `json:"results"`
-		Size    int   `json:"size"`
+		Results []map[string]any `json:"results"`
+		Size    int              `json:"size"`
 		Links   struct {
 			Next string `json:"next"`
 		} `json:"_links"`
-	}{Results: []any{}, Size: 0}
+	}{
+		Results: make([]map[string]any, 0, len(files)),
+		Size:    len(files),
+	}
+	// Sort filenames for deterministic output.
+	names := make([]string, 0, len(files))
+	for n := range files {
+		names = append(names, n)
+	}
+	// Simple insertion-style sort to avoid pulling in another import here.
+	for i := 1; i < len(names); i++ {
+		for j := i; j > 0 && names[j-1] > names[j]; j-- {
+			names[j-1], names[j] = names[j], names[j-1]
+		}
+	}
+	for _, name := range names {
+		out.Results = append(out.Results, map[string]any{
+			"id":    "att-" + pageID + "-" + name,
+			"title": name,
+			"_links": map[string]any{
+				"download": "/download/attachments/" + pageID + "/" + name,
+			},
+		})
+	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(out)
+}
+
+func (m *mockConfluence) handleUploadAttachment(w http.ResponseWriter, r *http.Request) {
+	// .../content/{pageID}/child/attachment
+	parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/rest/api/content/"), "/")
+	if len(parts) < 1 {
+		http.NotFound(w, r)
+		return
+	}
+	pageID := parts[0]
+
+	m.mu.Lock()
+	_, pageExists := m.pages[pageID]
+	m.mu.Unlock()
+	if !pageExists {
+		http.NotFound(w, r)
+		return
+	}
+
+	// Multipart form upload — extract the "file" part and stash its bytes
+	// under (pageID, filename).
+	if err := r.ParseMultipartForm(32 << 20); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	files := r.MultipartForm.File["file"]
+	if len(files) == 0 {
+		http.Error(w, "no file part", http.StatusBadRequest)
+		return
+	}
+	fh := files[0]
+	f, err := fh.Open()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer f.Close()
+	data := make([]byte, fh.Size)
+	if _, err := f.Read(data); err != nil && fh.Size > 0 {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	m.mu.Lock()
+	if m.attachments[pageID] == nil {
+		m.attachments[pageID] = make(map[string][]byte)
+	}
+	m.attachments[pageID][fh.Filename] = data
+	m.mu.Unlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	// Real Confluence echoes back the attachment metadata — clients ignore
+	// it, but emit something well-formed anyway.
+	_, _ = w.Write([]byte(`{"results":[]}`))
+}
+
+func (m *mockConfluence) handleDownloadAttachment(w http.ResponseWriter, r *http.Request) {
+	// /download/attachments/{pageID}/{filename}
+	rest := strings.TrimPrefix(r.URL.Path, "/download/attachments/")
+	parts := strings.SplitN(rest, "/", 2)
+	if len(parts) < 2 {
+		http.NotFound(w, r)
+		return
+	}
+	pageID, filename := parts[0], parts[1]
+
+	m.mu.Lock()
+	data, ok := m.attachments[pageID][filename]
+	m.mu.Unlock()
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", "application/octet-stream")
+	_, _ = w.Write(data)
+}
+
+// AttachmentsForPage returns a snapshot of the attachments uploaded to a
+// given page (filename → bytes). Empty if no attachments are on the page.
+func (m *mockConfluence) AttachmentsForPage(pageID string) map[string][]byte {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	src := m.attachments[pageID]
+	out := make(map[string][]byte, len(src))
+	for k, v := range src {
+		cp := make([]byte, len(v))
+		copy(cp, v)
+		out[k] = cp
+	}
+	return out
 }
 
 func (m *mockConfluence) handleCreate(w http.ResponseWriter, r *http.Request) {

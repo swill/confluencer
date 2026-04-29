@@ -207,6 +207,50 @@ func TestCfToMd_Image_RemoteURL(t *testing.T) {
 	}
 }
 
+// Block-level <ac:image> — Confluence emits this form when the image carries
+// styling attributes (ac:align, ac:width, ac:layout, ...). It must render as
+// a Markdown image, not get fence-encoded as an unsupported block.
+func TestCfToMd_Image_BlockLevel_StyledAttachment(t *testing.T) {
+	res := &stubResolver{
+		attachments: map[string]string{"aptum_offerings.png": "_attachments/aptum_offerings.png"},
+	}
+	in := `<ac:image ac:align="center" ac:alt="aptum_offerings.png" ac:custom-width="true" ac:layout="center" ac:local-id="8bfbff4b9417" ac:original-height="664" ac:original-width="1291" ac:width="1006"><ri:attachment ri:filename="aptum_offerings.png" ri:version-at-save="1"/></ac:image>`
+	want := "![aptum_offerings.png](_attachments/aptum_offerings.png)"
+	got := runCfToMd(t, in, CfToMdOpts{Attachments: res})
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+	if strings.Contains(got, "gfl:storage:block:v1:b64") {
+		t.Errorf("block-level image was fence-encoded instead of rendered: %q", got)
+	}
+}
+
+func TestCfToMd_Image_BlockLevel_PlainAttachment(t *testing.T) {
+	in := `<ac:image><ri:attachment ri:filename="schema.png"/></ac:image>`
+	want := "![schema](schema.png)"
+	if got := runCfToMd(t, in, CfToMdOpts{}); got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+func TestCfToMd_Image_BlockLevel_RemoteURL(t *testing.T) {
+	in := `<ac:image ac:alt="logo"><ri:url ri:value="https://example.com/logo.png"/></ac:image>`
+	want := "![logo](https://example.com/logo.png)"
+	if got := runCfToMd(t, in, CfToMdOpts{}); got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+// Block-level images alongside other block content — the image should render
+// as its own block separated by a blank line from the surrounding paragraphs.
+func TestCfToMd_Image_BlockLevel_AmongBlocks(t *testing.T) {
+	in := `<p>Above.</p><ac:image><ri:attachment ri:filename="x.png"/></ac:image><p>Below.</p>`
+	want := "Above.\n\n![x](x.png)\n\nBelow."
+	if got := runCfToMd(t, in, CfToMdOpts{}); got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
 func TestCfToMd_CodeMacro_WithLanguage(t *testing.T) {
 	in := `<ac:structured-macro ac:name="code"><ac:parameter ac:name="language">go</ac:parameter><ac:plain-text-body><![CDATA[fmt.Println("hi")]]></ac:plain-text-body></ac:structured-macro>`
 	want := "```go\nfmt.Println(\"hi\")\n```"

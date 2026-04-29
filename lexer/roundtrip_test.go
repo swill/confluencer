@@ -222,6 +222,10 @@ func TestRoundTrip_Storage_FixedPoint(t *testing.T) {
 		{"page-link", `<p>See <ac:link><ri:page ri:content-title="Architecture"/><ac:plain-text-link-body><![CDATA[arch]]></ac:plain-text-link-body></ac:link>.</p>`},
 		{"attachment", `<p><ac:image ac:alt="diagram"><ri:attachment ri:filename="diagram.png"/></ac:image></p>`},
 		{"external-image", `<p><ac:image ac:alt="logo"><ri:url ri:value="https://example.com/l.png"/></ac:image></p>`},
+		// Block-level <ac:image> with full Confluence-editor styling — the
+		// styling attributes are dropped on the first conversion (Markdown
+		// can't represent them), but the result must reach a fixed point.
+		{"attachment-block-styled", `<ac:image ac:align="center" ac:alt="diagram" ac:custom-width="true" ac:layout="center" ac:original-height="664" ac:original-width="1291" ac:width="1006"><ri:attachment ri:filename="diagram.png" ri:version-at-save="1"/></ac:image>`},
 		{"unknown-macro", `<ac:structured-macro ac:name="jira"><ac:parameter ac:name="key">PROJ-1</ac:parameter></ac:structured-macro>`},
 		{"admonition-info", `<ac:structured-macro ac:name="info"><ac:rich-text-body><p>watch out</p></ac:rich-text-body></ac:structured-macro>`},
 		{"admonition-note", `<ac:structured-macro ac:name="note"><ac:rich-text-body><p>FYI</p></ac:rich-text-body></ac:structured-macro>`},

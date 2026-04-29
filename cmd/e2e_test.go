@@ -141,6 +141,20 @@ func (r *e2eRepo) commit(rel, content, msg string) {
 	run(r.t, r.dir, "git", "commit", "-m", msg)
 }
 
+// writeBinary writes a binary file under the repo (creating directories) but
+// does not commit. Useful for staging an attachment that a subsequent
+// `commit` call (of a referencing .md) will sweep up.
+func (r *e2eRepo) writeBinary(rel string, data []byte) {
+	r.t.Helper()
+	full := filepath.Join(r.dir, filepath.FromSlash(rel))
+	if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+		r.t.Fatal(err)
+	}
+	if err := os.WriteFile(full, data, 0o644); err != nil {
+		r.t.Fatal(err)
+	}
+}
+
 // TestE2E_PullFromEmptyConfluenceIsClean verifies that an initial pull
 // against a tree with just a root page commits a single root index.md
 // on the confluence branch and merges it cleanly into main.
@@ -532,4 +546,238 @@ func TestE2E_DeleteOnConfluencePropagates(t *testing.T) {
 	if status := r.gitStatus(); status != "" {
 		t.Errorf("expected clean tree, got:\n%s", status)
 	}
+}
+
+// TestE2E_PushNewPageWithAttachment locks in the full image-handling fix:
+// a Markdown image referencing a file under _attachments must
+//
+//   - convert to <ri:attachment> in the storage XML sent to Confluence (not
+//     a broken <ri:url> pointing at a relative filesystem path), and
+//   - upload the binary file alongside the page write so the
+//     <ri:attachment> reference resolves on the Confluence side.
+//
+// Pre-fix, both halves were missing — the image link silently shipped as an
+// external URL and the binary never left the developer's machine.
+func TestE2E_PushNewPageWithAttachment(t *testing.T) {
+	r := newE2ERepo(t, [][4]string{
+		{"100", "", "Root", "<p>root</p>"},
+	})
+	if err := r.runPullInRepo(); err != nil {
+		t.Fatalf("seed pull: %v", err)
+	}
+
+	// User stages a binary attachment plus a Markdown file that references
+	// it via the relative-path form.
+	imgBytes := []byte{0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a, 'd', 'a', 't', 'a'}
+	r.writeBinary("docs/_attachments/diagram-page/schema.png", imgBytes)
+	mdBody := "# Diagram Page\n\nSee:\n\n![schema](_attachments/diagram-page/schema.png)\n"
+	r.commit("docs/diagram-page.md", mdBody, "add diagram-page with attachment")
+
+	if err := r.runPushInRepo(); err != nil {
+		t.Fatalf("push: %v", err)
+	}
+
+	// Find the page that just got created.
+	var newPageID string
+	for id, p := range r.mock.AllPages() {
+		if p.Title == "Diagram Page" {
+			newPageID = id
+			break
+		}
+	}
+	if newPageID == "" {
+		t.Fatalf("page not created; pages: %+v", r.mock.AllPages())
+	}
+
+	// The storage XML must reference the attachment, not a URL.
+	page := r.mock.PageByID(newPageID)
+	if !strings.Contains(page.Body, `<ri:attachment ri:filename="schema.png"`) {
+		t.Errorf("body should contain <ri:attachment>, got: %s", page.Body)
+	}
+	if strings.Contains(page.Body, `<ri:url`) {
+		t.Errorf("body should not contain <ri:url> for an attachment-backed image, got: %s", page.Body)
+	}
+
+	// The binary must have been uploaded.
+	atts := r.mock.AttachmentsForPage(newPageID)
+	got, ok := atts["schema.png"]
+	if !ok {
+		t.Fatalf("schema.png not uploaded; uploaded files: %v", keysOf(atts))
+	}
+	if string(got) != string(imgBytes) {
+		t.Errorf("uploaded bytes differ from disk:\n  want %v\n  got  %v", imgBytes, got)
+	}
+}
+
+// TestE2E_PushUpdateUploadsAttachment confirms uploads happen on the
+// modify path too, not just on adds. A second push that re-edits the
+// markdown body re-uploads the attachment (Confluence treats it as a new
+// version). This is the "user changed an image, push it" loop.
+func TestE2E_PushUpdateUploadsAttachment(t *testing.T) {
+	r := newE2ERepo(t, [][4]string{
+		{"100", "", "Root", "<p>root</p>"},
+	})
+	if err := r.runPullInRepo(); err != nil {
+		t.Fatalf("seed pull: %v", err)
+	}
+
+	// Initial push with image v1.
+	v1 := []byte("image-v1")
+	r.writeBinary("docs/_attachments/page-with-image/img.png", v1)
+	r.commit("docs/page-with-image.md",
+		"# Page With Image\n\n![alt](_attachments/page-with-image/img.png)\n",
+		"add page with image v1")
+	if err := r.runPushInRepo(); err != nil {
+		t.Fatalf("first push: %v", err)
+	}
+
+	var pageID string
+	for id, p := range r.mock.AllPages() {
+		if p.Title == "Page With Image" {
+			pageID = id
+			break
+		}
+	}
+	if pageID == "" {
+		t.Fatal("page not found after first push")
+	}
+	if string(r.mock.AttachmentsForPage(pageID)["img.png"]) != "image-v1" {
+		t.Errorf("v1 not uploaded")
+	}
+
+	// User replaces the image content (same filename) and tweaks the body.
+	v2 := []byte("image-v2-different")
+	r.writeBinary("docs/_attachments/page-with-image/img.png", v2)
+	cur := r.readFile("docs/page-with-image.md")
+	r.commit("docs/page-with-image.md",
+		strings.Replace(cur, "Page With Image", "Page With Image\n\nUpdated.", 1),
+		"update body and image")
+	if err := r.runPushInRepo(); err != nil {
+		t.Fatalf("second push: %v", err)
+	}
+
+	if string(r.mock.AttachmentsForPage(pageID)["img.png"]) != "image-v2-different" {
+		t.Errorf("v2 not uploaded; got: %q", r.mock.AttachmentsForPage(pageID)["img.png"])
+	}
+}
+
+// TestE2E_PushExternalImageNotUploaded asserts that an external image URL
+// (one that's not an attachment) does not trigger an upload attempt and
+// stays as <ri:url> in storage.
+func TestE2E_PushExternalImageNotUploaded(t *testing.T) {
+	r := newE2ERepo(t, [][4]string{
+		{"100", "", "Root", "<p>root</p>"},
+	})
+	if err := r.runPullInRepo(); err != nil {
+		t.Fatalf("seed pull: %v", err)
+	}
+
+	r.commit("docs/external.md",
+		"# External\n\n![logo](https://example.com/logo.png)\n",
+		"add page with external image")
+	if err := r.runPushInRepo(); err != nil {
+		t.Fatalf("push: %v", err)
+	}
+
+	var pageID string
+	for id, p := range r.mock.AllPages() {
+		if p.Title == "External" {
+			pageID = id
+			break
+		}
+	}
+	if pageID == "" {
+		t.Fatal("page not found after push")
+	}
+
+	page := r.mock.PageByID(pageID)
+	if !strings.Contains(page.Body, `<ri:url ri:value="https://example.com/logo.png"`) {
+		t.Errorf("external URL should round-trip as <ri:url>, got: %s", page.Body)
+	}
+	if len(r.mock.AttachmentsForPage(pageID)) != 0 {
+		t.Errorf("no attachments should be uploaded for external image; got: %v",
+			keysOf(r.mock.AttachmentsForPage(pageID)))
+	}
+}
+
+// TestE2E_PullStyledBlockImageRenders is the regression test for the
+// original user-reported symptom: a Confluence page with a block-level
+// <ac:image> carrying styling attributes was pulling down as a fenced
+// base64 blob (treated as an unsupported construct) instead of a Markdown
+// image. With Phase 1's fix, the same input must render cleanly.
+func TestE2E_PullStyledBlockImageRenders(t *testing.T) {
+	// Confluence editor's typical output for a sized/aligned image: an
+	// <ac:image> at the block level with a battery of ac:* attributes.
+	const styledImage = `<ac:image ac:align="center" ac:alt="aptum_offerings.png" ac:custom-width="true" ac:layout="center" ac:original-height="664" ac:original-width="1291" ac:width="1006"><ri:attachment ri:filename="aptum_offerings.png" ri:version-at-save="1"/></ac:image>`
+	r := newE2ERepo(t, [][4]string{
+		{"100", "", "Root", "<p>intro</p>" + styledImage + "<p>outro</p>"},
+	})
+
+	// Seed the attachment so pull's attachment download has something to
+	// pull (otherwise the binary side is silently empty — fine, but less
+	// realistic).
+	r.mock.mu.Lock()
+	r.mock.attachments["100"] = map[string][]byte{"aptum_offerings.png": []byte("png-bytes")}
+	r.mock.mu.Unlock()
+
+	if err := r.runPullInRepo(); err != nil {
+		t.Fatalf("pull: %v", err)
+	}
+
+	got := r.readFile("docs/index.md")
+	// Must contain a Markdown image reference, not a fence-encoded blob.
+	// The path is relative to the source file's directory, not repo-rooted
+	// — index.md lives in docs/, so the local-root prefix doesn't appear.
+	if !strings.Contains(got, "![aptum_offerings.png](_attachments/aptum_offerings.png)") {
+		t.Errorf("expected source-relative image reference, got:\n%s", got)
+	}
+	if strings.Contains(got, "](docs/_attachments/") {
+		t.Errorf("BUG REGRESSION: image src is repo-rooted (won't render in viewers):\n%s", got)
+	}
+	if strings.Contains(got, "gfl:storage:block:v1:b64") {
+		t.Errorf("BUG REGRESSION: block-level image was fence-encoded:\n%s", got)
+	}
+}
+
+// TestE2E_PullNestedPageImageHasParentRelativePath asserts the path format
+// for an image on a non-root page: a leading "../" is required so the path
+// resolves correctly when the file is viewed from its own directory.
+func TestE2E_PullNestedPageImageHasParentRelativePath(t *testing.T) {
+	const styledImage = `<ac:image><ri:attachment ri:filename="schema.png"/></ac:image>`
+	r := newE2ERepo(t, [][4]string{
+		{"100", "", "Root", "<p>root</p>"},
+		{"200", "100", "Sample", "<p>" + styledImage + "</p>"},
+	})
+
+	r.mock.mu.Lock()
+	r.mock.attachments["200"] = map[string][]byte{"schema.png": []byte("png")}
+	r.mock.mu.Unlock()
+
+	if err := r.runPullInRepo(); err != nil {
+		t.Fatalf("pull: %v", err)
+	}
+
+	got := r.readFile("docs/sample.md")
+	// Sample lives at docs/sample.md (flat). Its attachments live at
+	// docs/_attachments/sample/. Source dir = docs. So the relative path
+	// from docs to docs/_attachments/sample/schema.png is just
+	// _attachments/sample/schema.png.
+	if !strings.Contains(got, "![schema](_attachments/sample/schema.png)") {
+		t.Errorf("expected _attachments/sample/schema.png, got:\n%s", got)
+	}
+}
+
+// keysOf returns the keys of a map[string][]byte sorted, for stable error
+// messages in test failures.
+func keysOf(m map[string][]byte) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	for i := 1; i < len(out); i++ {
+		for j := i; j > 0 && out[j-1] > out[j]; j-- {
+			out[j-1], out[j] = out[j], out[j-1]
+		}
+	}
+	return out
 }
