@@ -288,6 +288,47 @@ func TestMdToCf_Table(t *testing.T) {
 	}
 }
 
+func TestMdToCf_Table_AlignmentEmittedAsCellStyle(t *testing.T) {
+	// Per-column alignment from the GFM separator row must travel on every
+	// header AND data cell as `style="text-align: …"`, since Confluence's
+	// storage doesn't have a colgroup equivalent. Pre-fix the writer
+	// dropped alignment entirely, so any push of an aligned table came
+	// back from a pull as a plain |---|---| table.
+	in := "| L | C | R |\n|:---|:---:|---:|\n| a | b | c |\n"
+	got := runMdToCf(t, in, MdToCfOpts{})
+	for _, want := range []string{
+		`<th style="text-align: left;">L</th>`,
+		`<th style="text-align: center;">C</th>`,
+		`<th style="text-align: right;">R</th>`,
+		`<td style="text-align: left;">a</td>`,
+		`<td style="text-align: center;">b</td>`,
+		`<td style="text-align: right;">c</td>`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("expected %q in storage XML, got:\n%s", want, got)
+		}
+	}
+
+	// Unaligned columns must not get a stray style attribute.
+	in2 := "| A | B |\n| --- | --- |\n| 1 | 2 |\n"
+	got2 := runMdToCf(t, in2, MdToCfOpts{})
+	if strings.Contains(got2, "style=") {
+		t.Errorf("unaligned table should not emit style attributes, got:\n%s", got2)
+	}
+}
+
+func TestRoundTrip_Table_PreservesAlignment(t *testing.T) {
+	// A user's table with center alignment must survive md → storage →
+	// md unchanged. This is the regression check for the user's reported
+	// "all columns came back as |---|---|" symptom.
+	in := "| Name | Score | Owner |\n| --- |:---:| --- |\n| a | 9 | x |\n| b | 5 | y |\n"
+	xml := runMdToCf(t, in, MdToCfOpts{})
+	back := runCfToMd(t, xml, CfToMdOpts{})
+	if !strings.Contains(back, ":---:") {
+		t.Errorf("center alignment lost in round trip:\n%s", back)
+	}
+}
+
 func TestMdToCf_Fence_SplicedVerbatim(t *testing.T) {
 	// The fence round trip — an HTML block matching our v1/b64 shape is
 	// decoded and the original storage XML is spliced in unchanged. This is

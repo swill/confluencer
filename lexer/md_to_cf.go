@@ -303,11 +303,18 @@ func (w *mdToCfWriter) writeHTMLBlock(n *ast.HTMLBlock) {
 // writeTable emits a GFM pipe table as <table><tbody> with <tr><th>/<tr><td>.
 // Confluence's storage uses <tbody> even for header rows (it derives "header"
 // from the cell tag, not the row grouping), so we don't emit <thead>.
+//
+// Per-column alignment from the GFM `:---:` / `---:` / `:---` syntax is
+// emitted as `style="text-align: …"` on each cell — both the header row's
+// <th>s and every data row's <td>s. Confluence storage doesn't have a
+// `<colgroup>` equivalent, so the alignment must travel on the cells.
 func (w *mdToCfWriter) writeTable(n *extast.Table) {
 	w.sb.WriteString("<table><tbody>")
+	alignments := n.Alignments
 	for c := n.FirstChild(); c != nil; c = c.NextSibling() {
 		_, isHeader := c.(*extast.TableHeader)
 		w.sb.WriteString("<tr>")
+		col := 0
 		for cell := c.FirstChild(); cell != nil; cell = cell.NextSibling() {
 			tc, ok := cell.(*extast.TableCell)
 			if !ok {
@@ -317,13 +324,35 @@ func (w *mdToCfWriter) writeTable(n *extast.Table) {
 			if isHeader {
 				tag = "th"
 			}
-			fmt.Fprintf(&w.sb, "<%s>", tag)
+			styleAttr := ""
+			if col < len(alignments) {
+				if css := tableAlignToCSS(alignments[col]); css != "" {
+					styleAttr = fmt.Sprintf(` style="text-align: %s;"`, css)
+				}
+			}
+			fmt.Fprintf(&w.sb, "<%s%s>", tag, styleAttr)
 			w.writeInline(tc)
 			fmt.Fprintf(&w.sb, "</%s>", tag)
+			col++
 		}
 		w.sb.WriteString("</tr>")
 	}
 	w.sb.WriteString("</tbody></table>")
+}
+
+// tableAlignToCSS maps goldmark's per-column alignment enum to the
+// CSS text-align values cf_to_md reads back. AlignNone returns "" so we
+// don't emit a redundant attribute when no alignment was specified.
+func tableAlignToCSS(a extast.Alignment) string {
+	switch a {
+	case extast.AlignLeft:
+		return "left"
+	case extast.AlignCenter:
+		return "center"
+	case extast.AlignRight:
+		return "right"
+	}
+	return ""
 }
 
 // --- Inline -----------------------------------------------------------------

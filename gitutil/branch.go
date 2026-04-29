@@ -21,6 +21,22 @@ func BranchExists(repoDir, name string) (bool, error) {
 	return false, fmt.Errorf("git rev-parse refs/heads/%s: %w", name, err)
 }
 
+// SetBranchRef force-updates the named branch to point at ref. Used by push
+// to fast-forward the confluence branch to the working branch's tip after
+// committing the sync chore directly on main, so confluence and main stay
+// in lockstep without requiring a merge commit.
+//
+// Refuses to operate on the currently-checked-out branch (git rejects
+// `git branch -f` on the active branch).
+func SetBranchRef(repoDir, name, ref string) error {
+	cmd := exec.Command("git", "branch", "-f", name, ref)
+	cmd.Dir = repoDir
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("git branch -f %s %s: %s: %w", name, ref, strings.TrimSpace(string(out)), err)
+	}
+	return nil
+}
+
 // EnsureBranchFromHead creates the named branch pointing at the current HEAD
 // commit if it doesn't already exist. Idempotent. Does not check out the new
 // branch — caller is responsible for that.
@@ -90,18 +106,6 @@ func CommitAllOnHead(repoDir, message string) (string, error) {
 // Other failures (no such branch, etc.) return an error.
 func MergeFrom(repoDir, from string) (conflict bool, err error) {
 	return mergeRun(repoDir, []string{"merge", "--no-edit", from}, from)
-}
-
-// MergeFromPreferTheirs runs `git merge --no-edit -X theirs <from>` — same
-// shape as MergeFrom, but conflicts auto-resolve in favour of <from>.
-//
-// Used by push after it advances the confluence branch: the working branch
-// needs to incorporate the just-pushed canonical form (frontmatter, version
-// bump, lexer normalisation) so the next pull's merge base is fresh. On the
-// rare line-level overlap, the canonical form is the authoritative version
-// — that's what's now on Confluence.
-func MergeFromPreferTheirs(repoDir, from string) (conflict bool, err error) {
-	return mergeRun(repoDir, []string{"merge", "--no-edit", "-X", "theirs", from}, from)
 }
 
 func mergeRun(repoDir string, args []string, from string) (conflict bool, err error) {

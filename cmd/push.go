@@ -34,6 +34,15 @@ func init() {
 }
 
 func runPush(cmd *cobra.Command, args []string) error {
+	// Push commits the sync chore directly on the working branch, which
+	// would otherwise fire the post-commit hook and recursively invoke
+	// `confluencer pull` — producing extra chore + merge commits and
+	// leaving the confluence ref pointing at the merge instead of the
+	// chore. Set the hook guard before any git operations so post-commit
+	// (and post-merge, post-rewrite) self-suppress for the duration of
+	// this run. This handles both hook-triggered and direct invocations.
+	_ = os.Setenv("CONFLUENCER_HOOK_ACTIVE", "1")
+
 	root, err := repoRoot()
 	if err != nil {
 		return err
@@ -113,7 +122,7 @@ func runPush(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	canonicalisePushOps(successes, cfg, ct, pm, out)
+	canonicalisePushOps(successes, creds.BaseURL, cfg, ct, pm, out)
 
 	if err := advanceConfluenceBranch(root, successes, out); err != nil {
 		return fmt.Errorf("advance %s branch: %w", confluenceBranch, err)
@@ -342,13 +351,13 @@ func updateExistingPage(client *api.Client, cfg *cfgpkg.Config, root, path, page
 // Best effort: if the round-trip fails for an op, the un-canonicalised body
 // is left in place. That preserves today's behaviour as a fallback rather
 // than aborting an otherwise-successful push.
-func canonicalisePushOps(ops []pushOp, cfg *cfgpkg.Config, ct *tree.CfTree, pm *tree.PathMap, out io.Writer) {
+func canonicalisePushOps(ops []pushOp, baseURL string, cfg *cfgpkg.Config, ct *tree.CfTree, pm *tree.PathMap, out io.Writer) {
 	for i := range ops {
 		op := &ops[i]
 		if op.StorageXML == "" || op.NewPath == "" {
 			continue
 		}
-		opts := resolverForPage(op.NewPath, cfg, ct, pm)
+		opts := resolverForPage(op.NewPath, baseURL, cfg, ct, pm)
 		rt, err := lexer.CfToMd(op.StorageXML, opts)
 		if err != nil {
 			fmt.Fprintf(out, "[confluencer] WARNING: canonicalise %s: %v\n", op.NewPath, err)
@@ -489,13 +498,15 @@ func ensurePushParents(client *api.Client, cfg *cfgpkg.Config, root, filePath st
 	return page.PageID
 }
 
-// advanceConfluenceBranch checks out the confluence branch, applies every
-// successful push op as a file-level change (with canonical front-matter),
-// commits them as a single sync commit, and returns to the original branch.
+// advanceConfluenceBranch applies every successful push op directly to the
+// working branch's working tree, commits them as a single sync chore commit,
+// and fast-forwards the confluence branch to the new tip. Linear history —
+// no merge commit. The confluence branch's tip is the new "last-known
+// Confluence-mirror state" against which the next push will diff, and it
+// is byte-equal to the working branch tip until pull advances it.
 //
-// Working-tree state on the original branch is preserved via stash/pop if
-// dirty. The confluence branch's tip after this is the new "last-known
-// Confluence-mirror state" against which the next push will diff.
+// Working-tree state is preserved via stash/pop if dirty. We never check
+// out the confluence branch — it's just a moveable ref.
 func advanceConfluenceBranch(root string, ops []pushOp, out io.Writer) error {
 	origBranch, err := gitutil.CurrentBranch(root)
 	if err != nil {
@@ -510,65 +521,30 @@ func advanceConfluenceBranch(root string, ops []pushOp, out io.Writer) error {
 		stashed = true
 	}
 
-	if err := gitutil.Checkout(root, confluenceBranch); err != nil {
-		if stashed {
-			_ = gitutil.StashPop(root)
-		}
-		return fmt.Errorf("checkout %s: %w", confluenceBranch, err)
-	}
-
 	for _, op := range ops {
-		if err := applyOpToConfluenceBranch(root, op, out); err != nil {
-			fmt.Fprintf(out, "[confluencer] WARNING: replay %s on %s: %v\n", op.NewPath, confluenceBranch, err)
+		if err := applyOpToWorkingTree(root, op, out); err != nil {
+			fmt.Fprintf(out, "[confluencer] WARNING: replay %s on %s: %v\n", op.NewPath, origBranch, err)
 		}
 	}
 
 	commitMsg := gitutil.SyncPrefix + "-push @ " + time.Now().UTC().Format(time.RFC3339)
 	sha, err := gitutil.CommitAllOnHead(root, commitMsg)
 	if err != nil {
-		_ = gitutil.Checkout(root, origBranch)
 		if stashed {
 			_ = gitutil.StashPop(root)
 		}
-		return fmt.Errorf("commit on %s: %w", confluenceBranch, err)
+		return fmt.Errorf("commit on %s: %w", origBranch, err)
 	}
 
-	if err := gitutil.Checkout(root, origBranch); err != nil {
-		return fmt.Errorf("return to %s: %w", origBranch, err)
-	}
-
-	// Merge the just-advanced confluence branch into the working branch so the
-	// push-side sync commit is in the working branch's ancestry. Without this,
-	// the merge base for the next pull would be the previous confluence tip,
-	// and changes the push has already mirrored would re-appear as fresh
-	// confluence-side edits — producing spurious conflicts when the user later
-	// edits the same lines.
-	//
-	// "-X theirs" is the right resolution policy here: when push creates a
-	// new page, the user's working-branch commit has no front-matter while
-	// the confluence-branch copy does. Both branches "added" the same path
-	// with different content; the canonical form (with front-matter, version,
-	// and lexer normalisation) is the authoritative one — that's what's now
-	// on Confluence. Same logic for the rarer in-place edit where lexer
-	// normalisation produced a body that differs from what the user typed.
-	//
-	// Tree is guaranteed clean here: we either entered clean, or stashed at
-	// the top of this function and haven't popped yet.
+	// Fast-forward confluence to the new commit. Skipped if the commit was
+	// a no-op (every successful op produced a working-tree state identical
+	// to what was already there) — confluence stays where it is.
 	if sha != "" {
-		conflict, mergeErr := gitutil.MergeFromPreferTheirs(root, confluenceBranch)
-		if mergeErr != nil {
+		if err := gitutil.SetBranchRef(root, confluenceBranch, "HEAD"); err != nil {
 			if stashed {
 				_ = gitutil.StashPop(root)
 			}
-			return fmt.Errorf("merge %s into %s after push: %w", confluenceBranch, origBranch, mergeErr)
-		}
-		if conflict {
-			// Don't pop the stash on top of an in-progress merge — leave the
-			// repo in a state the user can resolve with the standard tools.
-			fmt.Fprintf(out, "[confluencer] CONFLICT: post-push merge from %s has conflicts.\n", confluenceBranch)
-			fmt.Fprintf(out, "[confluencer]   Resolve with your editor and `git merge --continue`,\n")
-			fmt.Fprintf(out, "[confluencer]   or abort with `git merge --abort`.\n")
-			return nil
+			return fmt.Errorf("fast-forward %s: %w", confluenceBranch, err)
 		}
 	}
 
@@ -580,20 +556,20 @@ func advanceConfluenceBranch(root string, ops []pushOp, out io.Writer) error {
 	return nil
 }
 
-// applyOpToConfluenceBranch is the per-op replay on the confluence branch's
-// working tree. We're already checked out there.
-func applyOpToConfluenceBranch(root string, op pushOp, out io.Writer) error {
+// applyOpToWorkingTree is the per-op replay on the current branch's working
+// tree. We're already checked out where we want the commit to land.
+func applyOpToWorkingTree(root string, op pushOp, out io.Writer) error {
 	switch op.Action {
 	case gitutil.ActionAdded, gitutil.ActionModified:
 		return writeManagedFile(root, op.NewPath, op.PageID, op.Version, op.HeadContent)
 	case gitutil.ActionDeleted:
 		// Best-effort: ignore "not found" so a noop replay doesn't fail.
 		if err := gitutil.Remove(root, op.OldPath); err != nil {
-			fmt.Fprintf(out, "[confluencer] WARNING: git rm %s on %s: %v\n", op.OldPath, confluenceBranch, err)
+			fmt.Fprintf(out, "[confluencer] WARNING: git rm %s: %v\n", op.OldPath, err)
 		}
 		return nil
 	case gitutil.ActionRenamed:
-		// git mv old → new on the confluence branch, then rewrite the file
+		// git mv old → new on the working branch, then rewrite the file
 		// at the new path with updated front-matter and the latest body.
 		if err := gitutil.Move(root, op.OldPath, op.NewPath); err != nil {
 			return fmt.Errorf("git mv %s → %s: %w", op.OldPath, op.NewPath, err)

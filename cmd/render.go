@@ -92,8 +92,11 @@ func scanManagedFiles(repoRoot, localRoot string) ([]localManagedFile, error) {
 
 // resolverForPage builds the cf_to_md resolver pair for a given local path.
 // Cross-page links are resolved against the supplied PathMap; image attachment
-// references resolve to the per-page _attachments subdirectory.
-func resolverForPage(localPath string, cfg *cfgpkg.Config, ct *tree.CfTree, pm *tree.PathMap) lexer.CfToMdOpts {
+// references resolve to the per-page _attachments subdirectory. baseURL is
+// the Confluence wiki base (from credentials) so cf_to_md can build a working
+// URL when an ac:link points at a page outside the synced tree — without
+// it the URL would be silently dropped on conversion back to Markdown.
+func resolverForPage(localPath, baseURL string, cfg *cfgpkg.Config, ct *tree.CfTree, pm *tree.PathMap) lexer.CfToMdOpts {
 	return lexer.CfToMdOpts{
 		Pages: &treePageResolver{tree: ct, paths: pm},
 		Attachments: &stubAttachmentResolver{
@@ -101,6 +104,7 @@ func resolverForPage(localPath string, cfg *cfgpkg.Config, ct *tree.CfTree, pm *
 			attachmentsDir: cfg.AttachmentsDir,
 			localRoot:      cfg.LocalRoot,
 		},
+		BaseURL: baseURL,
 	}
 }
 
@@ -111,6 +115,20 @@ type treePageResolver struct {
 	paths *tree.PathMap
 }
 
+// ResolvePageByID returns the local path for pageID iff that page is part of
+// the in-memory tree (i.e. inside the configured root's subtree). This is
+// the authoritative "is this link to a tracked page" check — page IDs are
+// unique, so a hit here is never a false positive.
+func (r *treePageResolver) ResolvePageByID(pageID string) (string, bool) {
+	if !r.tree.Contains(pageID) {
+		return "", false
+	}
+	return r.paths.Path(pageID)
+}
+
+// ResolvePageByTitle is the legacy fallback used only when storage XML lacks
+// ri:content-id. Title matching is loose (a page outside the tree with the
+// same title will silently match), so it must never be the primary resolver.
 func (r *treePageResolver) ResolvePageByTitle(title, spaceKey string) (string, bool) {
 	var found *tree.CfNode
 	r.tree.Walk(func(n *tree.CfNode) {

@@ -32,10 +32,16 @@ import (
 // is preserved verbatim via EncodeBlockFence so that a subsequent push back to
 // Confluence carries the original construct unchanged.
 
-// PageResolver maps a Confluence page reference to a local file path. The path
-// is what cf_to_md emits as the link target. Returning ok=false causes the
-// converter to fall back to a plain text render of the link body.
+// PageResolver maps a Confluence page reference to a local file path. The
+// returned path is what cf_to_md emits as the link target.
+//
+// Title-based matching is too loose: pages with the same title across
+// different spaces would silently get redirected to the wrong local file.
+// The id-based method is the discriminator — only the page-id is unique.
+// ResolvePageByTitle is kept for fallback when storage XML lacks
+// ri:content-id (rare; most Confluence storage includes it).
 type PageResolver interface {
+	ResolvePageByID(pageID string) (localPath string, ok bool)
 	ResolvePageByTitle(title, spaceKey string) (localPath string, ok bool)
 }
 
@@ -51,6 +57,13 @@ type AttachmentRefResolver interface {
 type CfToMdOpts struct {
 	Pages       PageResolver
 	Attachments AttachmentRefResolver
+	// BaseURL is the Confluence wiki base (e.g. "https://yourorg.atlassian.net/wiki").
+	// When an <ac:link><ri:page …/> can't be resolved against the local sync tree
+	// (the page is in a different space, or hasn't been synced), the converter
+	// falls back to a regular Markdown link pointing at the Confluence URL
+	// derived from BaseURL plus the ri:content-id / ri:space-key it carries.
+	// Empty BaseURL preserves the legacy "drop URL, emit plain text" behaviour.
+	BaseURL string
 }
 
 // CfToMd converts a Confluence storage XML body to canonical Markdown. The
@@ -624,17 +637,95 @@ func (r *cfRenderer) writeAcLink(sb *strings.Builder, n *cfNode) {
 		bodyText = title
 	}
 
+	contentID := page.attr("ri:content-id")
+
 	if r.opts.Pages != nil {
-		if path, ok := r.opts.Pages.ResolvePageByTitle(title, space); ok {
-			fmt.Fprintf(sb, "[%s](%s)", bodyText, path)
-			return
+		// Prefer id-based resolution: only the page-id is unique. A page
+		// outside our local tree might share a title with one inside it
+		// — title-based matching would silently mis-route the link.
+		if contentID != "" {
+			if path, ok := r.opts.Pages.ResolvePageByID(contentID); ok {
+				fmt.Fprintf(sb, "[%s](%s)", bodyText, path)
+				return
+			}
+		} else {
+			// Storage didn't include an id (older Confluence, or our own
+			// title-only writes). Fall back to title resolution; it can
+			// mis-route on title collisions but it's better than treating
+			// every title-only ac:link as external.
+			if path, ok := r.opts.Pages.ResolvePageByTitle(title, space); ok {
+				fmt.Fprintf(sb, "[%s](%s)", bodyText, path)
+				return
+			}
 		}
 	}
-	// Unresolved page link — keep the text visible. Prefer the link body so
-	// the reader sees what the author wrote; fall back to the title.
+
+	// Either the id-bearing link points outside our tree, or there was no
+	// id and title resolution missed. Either way, the link refers to a page
+	// we don't track locally — emit a Confluence-side URL so the link stays
+	// clickable. Strict invariant: never silently drop the URL.
+	if url := buildConfluencePageURL(r.opts.BaseURL, page); url != "" {
+		fmt.Fprintf(sb, "[%s](%s)", bodyText, url)
+		return
+	}
+
+	// No identifying attributes at all (no id, no space, no title) —
+	// nothing to construct a URL from. Emit the body as text so the
+	// reader at least sees what was there.
 	if bodyText != "" {
 		sb.WriteString(escapeInlineText(bodyText))
 	}
+}
+
+// buildConfluencePageURL constructs a URL for an <ri:page> the local sync
+// tree didn't recognise. With a base URL it produces a clickable link
+// (preferring id-based paths because page IDs survive renames); without
+// one it falls back to the bare path so the URL is preserved and visibly
+// signals that the base URL wasn't configured at conversion time.
+//
+// Returns "" only if the <ri:page> has no usable attributes at all (no id,
+// no space-key, no title) — at which point there's nothing to link to.
+func buildConfluencePageURL(baseURL string, page *cfNode) string {
+	base := strings.TrimRight(baseURL, "/")
+	contentID := page.attr("ri:content-id")
+	spaceKey := page.attr("ri:space-key")
+	title := page.attr("ri:content-title")
+
+	var path string
+	switch {
+	case contentID != "" && spaceKey != "":
+		path = fmt.Sprintf("/spaces/%s/pages/%s", spaceKey, contentID)
+	case contentID != "":
+		path = fmt.Sprintf("/pages/viewpage.action?pageId=%s", contentID)
+	case title != "":
+		// Last resort: a search URL so the reader can still find the page.
+		path = fmt.Sprintf("/search?text=%s", urlQueryEscape(title))
+	default:
+		return ""
+	}
+	return base + path
+}
+
+func urlQueryEscape(s string) string {
+	// Lightweight percent-encoding for non-alphanumerics. We avoid pulling
+	// net/url into the lexer to keep the import surface small; the spec
+	// only needs to encode the few characters Confluence titles produce.
+	var sb strings.Builder
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9',
+			r == '-', r == '_', r == '.', r == '~':
+			sb.WriteRune(r)
+		case r == ' ':
+			sb.WriteByte('+')
+		default:
+			b := []byte(string(r))
+			for _, x := range b {
+				fmt.Fprintf(&sb, "%%%02X", x)
+			}
+		}
+	}
+	return sb.String()
 }
 
 // writeAcImage renders <ac:image> wrapping either <ri:attachment ri:filename>

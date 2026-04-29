@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"bytes"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -109,6 +110,19 @@ func (r *e2eRepo) gitStatus() string {
 	out, err := cmd.Output()
 	if err != nil {
 		r.t.Fatalf("git status: %v", err)
+	}
+	return string(out)
+}
+
+// gitLog returns `git log --pretty=oneline -n N` so tests can assert the
+// shape of recent history (e.g. "push produced a chore commit, not a merge").
+func (r *e2eRepo) gitLog(n int) string {
+	r.t.Helper()
+	cmd := exec.Command("git", "log", "--pretty=%P %s", fmt.Sprintf("-n%d", n))
+	cmd.Dir = r.dir
+	out, err := cmd.Output()
+	if err != nil {
+		r.t.Fatalf("git log: %v", err)
 	}
 	return string(out)
 }
@@ -221,6 +235,51 @@ func TestE2E_PushNewFileNoConflict(t *testing.T) {
 	// Working tree must still be clean — no merge conflict, no leftover state.
 	if status := r.gitStatus(); status != "" {
 		t.Errorf("BUG REGRESSION: expected clean tree after pull, got:\n%s", status)
+	}
+}
+
+// TestE2E_PushProducesLinearHistory locks in that push does not introduce a
+// merge commit on the working branch — the chore commit lands directly on
+// main and confluence fast-forwards to match. The user reported the
+// previous "chore + Merge branch 'confluence'" pair as noise; this test
+// guards against regressing back to that shape.
+func TestE2E_PushProducesLinearHistory(t *testing.T) {
+	r := newE2ERepo(t, [][4]string{
+		{"100", "", "Root", "<p>root body</p>"},
+	})
+	if err := r.runPullInRepo(); err != nil {
+		t.Fatalf("seed pull: %v", err)
+	}
+
+	r.commit("docs/new-page.md", "# New Page\n\nSome content.\n", "add new-page")
+	if err := r.runPushInRepo(); err != nil {
+		t.Fatalf("push: %v", err)
+	}
+
+	logTop := r.gitLog(1)
+	// "%P %s" prints parent-shas (space separated) then subject. A merge
+	// commit has two parents → two SHAs before the subject.
+	parents := strings.Fields(strings.SplitN(logTop, " ", 2)[0])
+	if len(parents) != 1 {
+		t.Errorf("expected linear history (single-parent commit at HEAD), got %d parents: %q", len(parents), logTop)
+	}
+	if !strings.Contains(logTop, "chore(sync): confluence-push") {
+		t.Errorf("expected HEAD to be the push chore commit, got: %q", logTop)
+	}
+
+	// confluence ref should now point at HEAD.
+	headSha, err := gitutil.HeadSHA(r.dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	confluenceSha, err := gitutil.HeadSHA(r.dir) // placeholder; we'll use show-ref below
+	_ = confluenceSha
+	out, err := exec.Command("git", "-C", r.dir, "rev-parse", confluenceBranch).Output()
+	if err != nil {
+		t.Fatalf("rev-parse %s: %v", confluenceBranch, err)
+	}
+	if got := strings.TrimSpace(string(out)); got != headSha {
+		t.Errorf("expected %s ref == HEAD (%s), got %s", confluenceBranch, headSha, got)
 	}
 }
 

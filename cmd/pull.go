@@ -148,7 +148,7 @@ func runPull(cmd *cobra.Command, args []string) error {
 	}
 
 	// Execute the plan on the confluence branch.
-	if err := executePullPlan(client, root, cfg, ct, pm, plan, out); err != nil {
+	if err := executePullPlan(client, root, creds.BaseURL, cfg, ct, pm, plan, out); err != nil {
 		return err
 	}
 
@@ -307,7 +307,7 @@ func classifyMissing(client *api.Client, candidates []localManagedFile) (deleted
 // confluence branch). Renames are applied first using a two-phase staging
 // protocol whenever any rename's destination is another rename's source;
 // then deletes; then writes.
-func executePullPlan(client *api.Client, root string, cfg *cfgpkg.Config, ct *tree.CfTree, pm *tree.PathMap, plan pullPlan, out io.Writer) error {
+func executePullPlan(client *api.Client, root, baseURL string, cfg *cfgpkg.Config, ct *tree.CfTree, pm *tree.PathMap, plan pullPlan, out io.Writer) error {
 	// Two-phase rename: if any rename's destination is another rename's
 	// source, route everyone through a staging dir to avoid intermediate
 	// path collisions. Otherwise direct git mv is fine.
@@ -341,7 +341,7 @@ func executePullPlan(client *api.Client, root string, cfg *cfgpkg.Config, ct *tr
 			fmt.Fprintf(out, "[confluencer] WARNING: fetch page %s: %v\n", pw.PageID, err)
 			continue
 		}
-		opts := resolverForPage(pw.TargetPath, cfg, ct, pm)
+		opts := resolverForPage(pw.TargetPath, baseURL, cfg, ct, pm)
 		content, err := renderPage(pw.PageID, page.Body, page.Version, opts)
 		if err != nil {
 			fmt.Fprintf(out, "[confluencer] WARNING: %v\n", err)

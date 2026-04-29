@@ -9,8 +9,14 @@ import (
 // pre-seeded map. Used to verify that resolved references render to the
 // configured paths and that unresolved ones fall back gracefully.
 type stubResolver struct {
-	pages       map[string]string // title → local path
-	attachments map[string]string // filename → src
+	pagesByID    map[string]string // page-id → local path (preferred)
+	pages        map[string]string // title → local path (legacy fallback)
+	attachments  map[string]string // filename → src
+}
+
+func (s *stubResolver) ResolvePageByID(pageID string) (string, bool) {
+	p, ok := s.pagesByID[pageID]
+	return p, ok
 }
 
 func (s *stubResolver) ResolvePageByTitle(title, _ string) (string, bool) {
@@ -93,9 +99,9 @@ func TestCfToMd_LinksExternal(t *testing.T) {
 
 func TestCfToMd_AcLink_Resolved(t *testing.T) {
 	res := &stubResolver{
-		pages: map[string]string{"Architecture": "../architecture.md"},
+		pagesByID: map[string]string{"7777": "../architecture.md"},
 	}
-	in := `<p>Read <ac:link><ri:page ri:content-title="Architecture"/><ac:plain-text-link-body><![CDATA[the arch doc]]></ac:plain-text-link-body></ac:link>.</p>`
+	in := `<p>Read <ac:link><ri:page ri:content-id="7777" ri:content-title="Architecture"/><ac:plain-text-link-body><![CDATA[the arch doc]]></ac:plain-text-link-body></ac:link>.</p>`
 	want := "Read [the arch doc](../architecture.md)."
 	got := runCfToMd(t, in, CfToMdOpts{Pages: res})
 	if got != want {
@@ -103,19 +109,69 @@ func TestCfToMd_AcLink_Resolved(t *testing.T) {
 	}
 }
 
+func TestCfToMd_AcLink_TitleMatchOutsideTree_StaysURL(t *testing.T) {
+	// Critical property: an ac:link whose content-id is NOT in our local
+	// tree must NOT be resolved against a title-matching local file. Pre-fix,
+	// title matching was the only mechanism — so a link to "Architecture"
+	// in a different space silently got rewritten to ../architecture.md
+	// pointing at OUR Architecture page (wrong page). With id-based
+	// resolution, we know the linked page (id=99999) isn't ours and emit
+	// the Confluence URL instead.
+	res := &stubResolver{
+		// We DO have a local "Architecture" — under id 7777 — but the link
+		// is to an entirely different page that happens to share the title.
+		pagesByID: map[string]string{"7777": "architecture.md"},
+		pages:     map[string]string{"Architecture": "architecture.md"},
+	}
+	in := `<p>Read <ac:link><ri:page ri:content-id="99999" ri:space-key="OTHER" ri:content-title="Architecture"/><ac:plain-text-link-body><![CDATA[other arch]]></ac:plain-text-link-body></ac:link>.</p>`
+	want := "Read [other arch](https://example.com/wiki/spaces/OTHER/pages/99999)."
+	got := runCfToMd(t, in, CfToMdOpts{Pages: res, BaseURL: "https://example.com/wiki"})
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
 func TestCfToMd_AcLink_Unresolved(t *testing.T) {
+	// No resolver and no BaseURL — we still emit a Markdown link rather
+	// than dropping the URL on the floor. The href is path-only (greppable,
+	// non-clickable) so a misconfigured run is visible rather than silent.
 	in := `<p>Read <ac:link><ri:page ri:content-title="Missing Page"/><ac:plain-text-link-body><![CDATA[here]]></ac:plain-text-link-body></ac:link>.</p>`
-	// No resolver — emit the link body as plain text so the reader still sees
-	// what was there.
-	want := "Read here."
+	want := "Read [here](/search?text=Missing+Page)."
 	if got := runCfToMd(t, in, CfToMdOpts{}); got != want {
 		t.Errorf("got %q, want %q", got, want)
 	}
 }
 
+func TestCfToMd_AcLink_UnresolvedWithBaseURL_BuildsConfluenceURL(t *testing.T) {
+	// When an ac:link points outside the local sync tree but a BaseURL is
+	// configured, cf_to_md keeps the link clickable by constructing the
+	// Confluence-side URL from ri:content-id / ri:space-key. Pre-fix, the
+	// URL was dropped silently — turning every cross-space reference into
+	// orphan text.
+	in := `<p>See <ac:link><ri:page ri:content-id="3376513043" ri:space-key="Product" ri:content-title="Product Strategy v1.3.1"/><ac:plain-text-link-body><![CDATA[Product Strategy v1.3.1]]></ac:plain-text-link-body></ac:link>.</p>`
+	want := "See [Product Strategy v1.3.1](https://yourorg.atlassian.net/wiki/spaces/Product/pages/3376513043)."
+	got := runCfToMd(t, in, CfToMdOpts{BaseURL: "https://yourorg.atlassian.net/wiki"})
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+func TestCfToMd_AcLink_UnresolvedNoSpaceKey_UsesViewpageURL(t *testing.T) {
+	// Older content sometimes lacks ri:space-key. Fall back to the
+	// id-based viewpage URL, which still resolves.
+	in := `<p>See <ac:link><ri:page ri:content-id="42"/><ac:plain-text-link-body><![CDATA[old page]]></ac:plain-text-link-body></ac:link>.</p>`
+	want := "See [old page](https://example.com/wiki/pages/viewpage.action?pageId=42)."
+	got := runCfToMd(t, in, CfToMdOpts{BaseURL: "https://example.com/wiki"})
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
 func TestCfToMd_AcLink_NoBody_FallsBackToTitle(t *testing.T) {
+	// With no plain-text-link-body, the title is used both as the link
+	// text and as the search-URL fallback so the URL is preserved.
 	in := `<p>See <ac:link><ri:page ri:content-title="Some Page"/></ac:link>.</p>`
-	want := "See Some Page."
+	want := "See [Some Page](/search?text=Some+Page)."
 	if got := runCfToMd(t, in, CfToMdOpts{}); got != want {
 		t.Errorf("got %q, want %q", got, want)
 	}

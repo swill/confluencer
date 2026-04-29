@@ -30,8 +30,12 @@ import (
 // and reverse maps in one place makes it impossible to accidentally break
 // round-trip symmetry by seeding one direction and forgetting the other.
 type paired struct {
-	// titleToPath[title] = local path that <ac:link><ri:page title/> maps to
-	// in the Markdown direction.
+	// idToPath[pageID] = local path that <ac:link><ri:page ri:content-id/>
+	// maps to. The id-based discriminator cf_to_md prefers because ids are
+	// unique across spaces.
+	idToPath map[string]string
+	// titleToPath[title] = local path used when storage XML lacks
+	// ri:content-id (legacy fallback only).
 	titleToPath map[string]string
 	// pathToTitle[path] = title to emit when md_to_cf sees a link to this
 	// path. Should be the inverse of titleToPath for round-trip tests.
@@ -44,6 +48,10 @@ type paired struct {
 	srcToFilename map[string]string
 }
 
+func (p *paired) ResolvePageByID(pageID string) (string, bool) {
+	s, ok := p.idToPath[pageID]
+	return s, ok
+}
 func (p *paired) ResolvePageByTitle(title, _ string) (string, bool) {
 	s, ok := p.titleToPath[title]
 	return s, ok

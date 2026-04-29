@@ -88,7 +88,7 @@ func runInit(cmd *cobra.Command, args []string) error {
 			return
 		}
 
-		opts := resolverForPage(localPath, cfg, ct, pm)
+		opts := resolverForPage(localPath, creds.BaseURL, cfg, ct, pm)
 		content, err := renderPage(n.PageID, n.Body, n.Version, opts)
 		if err != nil {
 			fmt.Fprintf(out, "  WARNING: %v\n", err)
