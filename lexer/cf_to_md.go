@@ -315,32 +315,18 @@ func (r *cfRenderer) renderMacro(n *cfNode) string {
 			body = b.innerText()
 		}
 		return "```" + lang + "\n" + strings.TrimRight(body, "\n") + "\n```"
-	case "info", "note", "warning", "tip":
-		// Capitalise the first ASCII letter for the label ("info" → "Info").
-		// strings.Title is deprecated and overkill for these fixed keywords.
-		name := n.attr("ac:name")
-		label := strings.ToUpper(name[:1]) + name[1:]
-		body := ""
-		if b := n.firstElement("ac:rich-text-body"); b != nil {
-			var inner cfRenderer
-			inner.opts = r.opts
-			inner.renderBlocks(b.children)
-			body = strings.TrimSpace(inner.sb.String())
-		}
-		// Single-paragraph admonitions render as "> **Label:** text"; multi-
-		// paragraph ones get the label on its own line and the body indented
-		// underneath. The blockquote prefix is added uniformly afterwards.
-		var inner string
-		if strings.Contains(body, "\n") {
-			inner = "**" + label + ":**\n\n" + body
-		} else {
-			inner = "**" + label + ":** " + body
-		}
-		return prefixBlockquote(inner)
 	case "toc":
 		// Per CLAUDE.md mapping: TOC macro is omitted entirely.
 		return ""
 	}
+	// Admonitions (info, note, warning, tip) and every other structured
+	// macro fall through to fence preservation. An earlier rendering of
+	// admonitions as `> **Info:** ...` blockquotes was lossy on push:
+	// goldmark parses that as <blockquote><p><strong>Info:</strong>...
+	// which md_to_cf restores as <blockquote>, REPLACING the original
+	// macro on Confluence. The first body-only edit after a pull would
+	// silently destroy the panel. The fence keeps the original storage
+	// XML intact across an arbitrary number of edit cycles.
 	return EncodeBlockFence(serializeXML(n))
 }
 

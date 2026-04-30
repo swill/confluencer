@@ -252,6 +252,14 @@ func TestRoundTrip_Storage_FixedPoint(t *testing.T) {
 		{"user-mention-paragraph-start", `<p><ac:link><ri:user ri:account-id="557058:abc"/></ac:link> please review.</p>`},
 		// Attachment download link (distinct from <ac:image> embeds).
 		{"attachment-download-link", `<p>See <ac:link><ri:attachment ri:filename="report.pdf"/><ac:plain-text-link-body><![CDATA[the report]]></ac:plain-text-link-body></ac:link>.</p>`},
+		// Multi-paragraph admonition — fence-preserved so all blocks
+		// inside the rich-text-body survive the round trip.
+		{"info-multi-paragraph", `<ac:structured-macro ac:name="info"><ac:rich-text-body><p>first paragraph</p><p>second paragraph</p></ac:rich-text-body></ac:structured-macro>`},
+		{"warning-with-formatting", `<ac:structured-macro ac:name="warning"><ac:rich-text-body><p>be <strong>very</strong> careful</p></ac:rich-text-body></ac:structured-macro>`},
+		// Mixed: prose, then info panel, then more prose. Pre-fix, an
+		// edit to either prose paragraph would replace the panel with a
+		// generic <blockquote> on Confluence.
+		{"info-between-paragraphs", `<p>Above.</p><ac:structured-macro ac:name="info"><ac:rich-text-body><p>panel body</p></ac:rich-text-body></ac:structured-macro><p>Below.</p>`},
 	}
 	res := newPaired()
 	opts := CfToMdOpts{Pages: res, Attachments: res}
@@ -272,6 +280,60 @@ func TestRoundTrip_Storage_FixedPoint(t *testing.T) {
 }
 
 // --- Property-style tests ---------------------------------------------------
+
+// TestRoundTrip_AdmonitionSurvivesEdits is the regression test for the
+// user-reported bug: an info panel in Confluence pulls down to markdown,
+// and the very first user edit (to an unrelated paragraph in the same
+// page) replaces the panel with a generic <blockquote> on push. The fix:
+// fence-preserve the macro so it survives an arbitrary number of
+// pull→edit→push cycles.
+//
+// Concretely: storage → md → simulate a user edit on an unrelated line
+// → md → storage. The admonition macro on the second storage must match
+// the first.
+func TestRoundTrip_AdmonitionSurvivesEdits(t *testing.T) {
+	original := `<p>intro paragraph</p><ac:structured-macro ac:name="info"><ac:rich-text-body><p>important info</p></ac:rich-text-body></ac:structured-macro><p>outro paragraph</p>`
+
+	// Cycle 1: pull → edit unrelated line → push.
+	md1, err := CfToMd(original, CfToMdOpts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	edited := strings.Replace(md1, "intro paragraph", "intro edited", 1)
+	if edited == md1 {
+		t.Fatalf("intro substitution didn't apply to: %q", md1)
+	}
+	pushed1, err := MdToCf(edited, MdToCfOpts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(pushed1, `ac:name="info"`) {
+		t.Fatalf("info macro lost on cycle 1 push:\n%s", pushed1)
+	}
+	if strings.Contains(pushed1, "<blockquote>") {
+		t.Errorf("BUG REGRESSION: admonition replaced by <blockquote>:\n%s", pushed1)
+	}
+	if !strings.Contains(pushed1, "important info") {
+		t.Errorf("admonition body content lost: %s", pushed1)
+	}
+
+	// Cycle 2: re-pull and edit again — the macro must STILL survive.
+	md2, err := CfToMd(pushed1, CfToMdOpts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	edited2 := strings.Replace(md2, "outro paragraph", "outro edited", 1)
+	pushed2, err := MdToCf(edited2, MdToCfOpts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(pushed2, `ac:name="info"`) {
+		t.Errorf("info macro lost on cycle 2 push:\n%s", pushed2)
+	}
+	if !strings.Contains(pushed2, "important info") {
+		t.Errorf("admonition body content lost on cycle 2: %s", pushed2)
+	}
+}
 
 // TestRoundTrip_FencePreservesArbitraryXML verifies that an opaque XML
 // payload inside a v1/b64 fence survives the full md_to_cf(cf_to_md(...))
